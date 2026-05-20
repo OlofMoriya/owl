@@ -6,9 +6,12 @@ import (
 	"os/exec"
 	"owl/data"
 	"owl/logger"
+	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/fatih/color"
@@ -56,7 +59,11 @@ func (tool *FileUpdateTool) Run(i map[string]string) (string, error) {
 	}
 
 	if err := validateUnifiedDiff(diff); err != nil {
-		return "", fmt.Errorf("Invalid unified diff: %w", err)
+		artifactPath, writeErr := persistFailedDiffArtifact(fileName, diff, "validation", "", "", err)
+		if writeErr != nil {
+			return "", fmt.Errorf("Invalid unified diff: %w (also failed to persist failed diff: %v)", err, writeErr)
+		}
+		return "", fmt.Errorf("Invalid unified diff: %w (saved at %s)", err, artifactPath)
 	}
 
 	logger.Screen(fmt.Sprintf("\nAsked to apply diff"), color.RGB(150, 150, 150))
@@ -125,22 +132,170 @@ func (tool *FileUpdateTool) applyDiff(fileName, diff string) (string, error) {
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
-		// If git apply fails, try with patch command
-		cmd = exec.Command("patch", "-p0", fileName)
-		patchInput := strings.NewReader(diff)
-		cmd.Stdin = patchInput
-		output, err = cmd.CombinedOutput()
-		logger.Screen(fmt.Sprintf("\nfailed to apply diff, testing patch"), color.RGB(150, 150, 150))
+		logger.Screen("\nfailed to apply with git apply, testing patch fallback", color.RGB(150, 150, 150))
+		gitApplyOutput := string(output)
 
-		if err != nil {
-			logger.Screen(fmt.Sprintf("\nfailed to apply patch"), color.RGB(150, 150, 150))
-			return "", fmt.Errorf("Failed to apply patch: %s\nOutput: %s", err, string(output))
+		// If git apply fails, try with patch command and common strip levels.
+		stripLevels := []string{"1", "0"}
+		var lastErr error
+		var lastOutput []byte
+		for _, stripLevel := range stripLevels {
+			cmd = exec.Command("patch", "-p"+stripLevel, "-i", tmpFile.Name())
+			output, err = cmd.CombinedOutput()
+			if err == nil {
+				lastErr = nil
+				lastOutput = output
+				break
+			}
+			lastErr = err
+			lastOutput = output
 		}
+
+		if lastErr != nil {
+			logger.Screen("\nfailed to apply patch, testing content-based fallback", color.RGB(150, 150, 150))
+
+			if contentFallbackErr := applyDiffByContent(fileName, diff); contentFallbackErr == nil {
+				result := fmt.Sprintf("Successfully applied diff to '%s' using content-based fallback", fileName)
+				logger.Screen(result, color.RGB(150, 150, 150))
+				return result, nil
+			}
+
+			logger.Screen("\ncontent-based fallback failed", color.RGB(150, 150, 150))
+			artifactPath, writeErr := persistFailedDiffArtifact(fileName, diff, "apply", gitApplyOutput, string(lastOutput), lastErr)
+			if writeErr != nil {
+				return "", fmt.Errorf(
+					"Failed to apply patch. git apply output: %s\npatch output: %s\nerror: %s\n(additionally failed to persist failed diff: %v)",
+					gitApplyOutput,
+					string(lastOutput),
+					lastErr,
+					writeErr,
+				)
+			}
+			return "", fmt.Errorf(
+				"Failed to apply patch. git apply output: %s\npatch output: %s\nerror: %s\nfailed diff saved at: %s",
+				gitApplyOutput,
+				string(lastOutput),
+				lastErr,
+				artifactPath,
+			)
+		}
+
+		output = lastOutput
 	}
 
 	result := fmt.Sprintf("Successfully applied diff to '%s'\n%s", fileName, string(output))
 	logger.Screen(result, color.RGB(150, 150, 150))
 	return result, nil
+}
+
+func applyDiffByContent(fileName, diff string) error {
+	bytes, err := os.ReadFile(fileName)
+	if err != nil {
+		return err
+	}
+
+	content := strings.ReplaceAll(string(bytes), "\r\n", "\n")
+	fileLines := strings.Split(content, "\n")
+
+	hunks, err := parseUnifiedDiffHunks(diff)
+	if err != nil {
+		return err
+	}
+
+	for _, hunk := range hunks {
+		oldLines := make([]string, 0, len(hunk.Body))
+		newLines := make([]string, 0, len(hunk.Body))
+
+		for _, line := range hunk.Body {
+			if line == "" {
+				return fmt.Errorf("empty line in hunk body")
+			}
+			switch line[0] {
+			case ' ':
+				oldLines = append(oldLines, line[1:])
+				newLines = append(newLines, line[1:])
+			case '-':
+				oldLines = append(oldLines, line[1:])
+			case '+':
+				newLines = append(newLines, line[1:])
+			case '\\':
+				// "\\ No newline at end of file" metadata, ignore
+			default:
+				return fmt.Errorf("unexpected hunk line prefix %q", string(line[0]))
+			}
+		}
+
+		if len(oldLines) == 0 {
+			return fmt.Errorf("content fallback does not support pure insert hunks")
+		}
+
+		start := indexOfSubslice(fileLines, oldLines)
+		if start < 0 {
+			return fmt.Errorf("could not locate hunk content in target file")
+		}
+
+		replaced := make([]string, 0, len(fileLines)-len(oldLines)+len(newLines))
+		replaced = append(replaced, fileLines[:start]...)
+		replaced = append(replaced, newLines...)
+		replaced = append(replaced, fileLines[start+len(oldLines):]...)
+		fileLines = replaced
+	}
+
+	newContent := strings.Join(fileLines, "\n")
+	return os.WriteFile(fileName, []byte(newContent), 0o644)
+}
+
+type parsedHunk struct {
+	Body []string
+}
+
+func parseUnifiedDiffHunks(diff string) ([]parsedHunk, error) {
+	diff = strings.ReplaceAll(diff, "\r\n", "\n")
+	lines := strings.Split(diff, "\n")
+
+	hunks := []parsedHunk{}
+	i := 0
+	for i < len(lines) {
+		line := lines[i]
+		if isHunkHeaderLine(line) {
+			h := parsedHunk{Body: []string{}}
+			i++
+			for i < len(lines) {
+				line = lines[i]
+				if isHunkHeaderLine(line) || strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "+++ ") {
+					break
+				}
+				if line != "" {
+					h.Body = append(h.Body, line)
+				}
+				i++
+			}
+			if len(h.Body) == 0 {
+				return nil, fmt.Errorf("empty hunk body")
+			}
+			hunks = append(hunks, h)
+			continue
+		}
+		i++
+	}
+
+	if len(hunks) == 0 {
+		return nil, fmt.Errorf("no hunks found")
+	}
+
+	return hunks, nil
+}
+
+func indexOfSubslice(haystack []string, needle []string) int {
+	if len(needle) == 0 || len(needle) > len(haystack) {
+		return -1
+	}
+	for i := 0; i <= len(haystack)-len(needle); i++ {
+		if slices.Equal(haystack[i:i+len(needle)], needle) {
+			return i
+		}
+	}
+	return -1
 }
 
 func (tool *FileUpdateTool) GetName() string {
@@ -222,25 +377,23 @@ func validateUnifiedDiff(diff string) error {
 				break
 			}
 
-			if !strings.HasPrefix(line, "@@ ") {
+			if !isHunkHeaderLine(line) {
 				return fmt.Errorf("line %d: expected hunk header '@@', got %q", i+1, line)
 			}
 
-			oldCount, newCount, err := parseHunkCounts(line, i+1)
-			if err != nil {
-				return err
+			if strings.HasPrefix(line, "@@ ") {
+				if _, _, err := parseHunkCounts(line, i+1); err != nil {
+					return err
+				}
 			}
 
 			hunksForFile++
 			i++
 
-			oldSeen := 0
-			newSeen := 0
-
 			for i < len(lines) {
 				line = lines[i]
 
-				if strings.HasPrefix(line, "@@ ") || strings.HasPrefix(line, "--- ") {
+				if isHunkHeaderLine(line) || strings.HasPrefix(line, "--- ") {
 					break
 				}
 
@@ -258,28 +411,13 @@ func validateUnifiedDiff(diff string) error {
 
 				switch line[0] {
 				case ' ':
-					oldSeen++
-					newSeen++
 				case '-':
-					oldSeen++
 				case '+':
-					newSeen++
 				default:
 					return fmt.Errorf("line %d: malformed hunk body, unexpected prefix %q", i+1, string(line[0]))
 				}
 
 				i++
-			}
-
-			if oldSeen != oldCount || newSeen != newCount {
-				return fmt.Errorf(
-					"line %d: hunk count mismatch, header expects -%d +%d but body has -%d +%d",
-					i,
-					oldCount,
-					newCount,
-					oldSeen,
-					newSeen,
-				)
 			}
 		}
 
@@ -321,6 +459,54 @@ func parseHunkCounts(header string, lineNumber int) (int, int, error) {
 	}
 
 	return oldCount, newCount, nil
+}
+
+func isHunkHeaderLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "@@" {
+		return true
+	}
+	return strings.HasPrefix(line, "@@ ")
+}
+
+func persistFailedDiffArtifact(fileName, diff, stage, gitApplyOutput, patchOutput string, applyErr error) (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+
+	owlDir := filepath.Join(homeDir, ".owl")
+	if err := os.MkdirAll(owlDir, 0o755); err != nil {
+		return "", err
+	}
+
+	timestamp := time.Now().Format("20060102-150405.000")
+	artifactName := fmt.Sprintf("failed-diff-%s-%d.log", timestamp, os.Getpid())
+	artifactPath := filepath.Join(owlDir, artifactName)
+
+	content := strings.Builder{}
+	content.WriteString("stage: " + stage + "\n")
+	content.WriteString("file: " + fileName + "\n")
+	content.WriteString("time: " + time.Now().Format(time.RFC3339Nano) + "\n")
+	if applyErr != nil {
+		content.WriteString("error: " + applyErr.Error() + "\n")
+	}
+	content.WriteString("\n=== git apply output ===\n")
+	content.WriteString(gitApplyOutput)
+	content.WriteString("\n\n=== patch output ===\n")
+	content.WriteString(patchOutput)
+	content.WriteString("\n\n=== diff ===\n")
+	content.WriteString(diff)
+	if !strings.HasSuffix(diff, "\n") {
+		content.WriteString("\n")
+	}
+
+	if err := os.WriteFile(artifactPath, []byte(content.String()), 0o644); err != nil {
+		return "", err
+	}
+
+	logger.Debug.Printf("Saved failed diff artifact to %s", artifactPath)
+	return artifactPath, nil
 }
 
 // Helper functions

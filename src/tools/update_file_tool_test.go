@@ -39,7 +39,7 @@ func TestValidateUnifiedDiff_MissingPrefixInHunkBody(t *testing.T) {
 	}
 }
 
-func TestValidateUnifiedDiff_HunkCountMismatch(t *testing.T) {
+func TestValidateUnifiedDiff_HunkCountMismatchAllowed(t *testing.T) {
 	diff := strings.Join([]string{
 		"--- a/file.txt",
 		"+++ b/file.txt",
@@ -49,17 +49,12 @@ func TestValidateUnifiedDiff_HunkCountMismatch(t *testing.T) {
 		"",
 	}, "\n")
 
-	err := validateUnifiedDiff(diff)
-	if err == nil {
-		t.Fatalf("expected validation error for hunk count mismatch")
-	}
-
-	if !strings.Contains(err.Error(), "hunk count mismatch") {
-		t.Fatalf("expected hunk count mismatch error, got: %v", err)
+	if err := validateUnifiedDiff(diff); err != nil {
+		t.Fatalf("expected hunk count mismatch to be accepted, got: %v", err)
 	}
 }
 
-func TestValidateUnifiedDiff_EmptyFirstHunkThenAnotherHunk(t *testing.T) {
+func TestValidateUnifiedDiff_EmptyFirstHunkThenAnotherHunkAllowed(t *testing.T) {
 	diff := strings.Join([]string{
 		"--- a/file.txt",
 		"+++ b/file.txt",
@@ -70,12 +65,22 @@ func TestValidateUnifiedDiff_EmptyFirstHunkThenAnotherHunk(t *testing.T) {
 		"",
 	}, "\n")
 
-	err := validateUnifiedDiff(diff)
-	if err == nil {
-		t.Fatalf("expected validation error for empty first hunk")
+	if err := validateUnifiedDiff(diff); err != nil {
+		t.Fatalf("expected validator to allow empty first hunk, got: %v", err)
 	}
+}
 
-	if !strings.Contains(err.Error(), "hunk count mismatch") {
-		t.Fatalf("expected hunk count mismatch error, got: %v", err)
+func TestValidateUnifiedDiff_BareAtAtHeaderAllowed(t *testing.T) {
+	diff := strings.Join([]string{
+		"--- a/file.txt",
+		"+++ b/file.txt",
+		"@@",
+		"-old line",
+		"+new line",
+		"",
+	}, "\n")
+
+	if err := validateUnifiedDiff(diff); err != nil {
+		t.Fatalf("expected bare @@ header to be accepted, got: %v", err)
 	}
 }
