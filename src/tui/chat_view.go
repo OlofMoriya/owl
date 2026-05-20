@@ -2,14 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"github.com/atotto/clipboard"
-	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/glamour"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/muesli/termenv"
 	"os"
 	"owl/agents"
 	commontypes "owl/common_types"
@@ -24,7 +16,70 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/atotto/clipboard"
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/reflow/ansi"
+	"github.com/muesli/reflow/truncate"
+	"github.com/muesli/termenv"
 )
+
+func renderWithBackground(rendered string, width int, bg termenv.Color) string {
+	lines := strings.Split(rendered, "\n")
+	bgPrefix := backgroundPrefix(bg)
+	reset := "\x1b[0m"
+
+	for i, line := range lines {
+		// Tabs in markdown/code blocks render wider than rune counts,
+		// which can make some lines visually protrude.
+		line = strings.ReplaceAll(line, "\t", "    ")
+
+		lineWidth := ansi.PrintableRuneWidth(line)
+		if lineWidth > width {
+			line = truncate.String(line, uint(width))
+			lineWidth = ansi.PrintableRuneWidth(line)
+		}
+
+		if lineWidth < width {
+			line += strings.Repeat(" ", width-lineWidth)
+		}
+
+		withBg := bgPrefix + line
+		withBg = strings.ReplaceAll(withBg, "\x1b[0m", "\x1b[0m"+bgPrefix)
+		withBg = strings.ReplaceAll(withBg, "\x1b[m", "\x1b[m"+bgPrefix)
+		lines[i] = withBg + reset
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func renderWithBackgroundAndPadding(rendered string, contentWidth int, horizontalPadding int, bg termenv.Color) string {
+	if horizontalPadding < 0 {
+		horizontalPadding = 0
+	}
+	pad := strings.Repeat(" ", horizontalPadding)
+
+	lines := strings.Split(rendered, "\n")
+	for i, line := range lines {
+		lines[i] = pad + line + pad
+	}
+
+	return renderWithBackground(strings.Join(lines, "\n"), contentWidth+(2*horizontalPadding), bg)
+}
+
+func backgroundPrefix(bg termenv.Color) string {
+	sample := termenv.String("X").Background(bg).String()
+	idx := strings.Index(sample, "X")
+	if idx <= 0 {
+		return ""
+	}
+	return sample[:idx]
+}
 
 type chatMode int
 
@@ -1182,12 +1237,12 @@ func (m *chatViewModel) View() string {
 		status = dimStyle.Render(fmt.Sprintf("%s %s", status, m.statusMessage))
 	}
 
-	modeIndicator := ""
+	modeLabel := "Mode: INPUT"
 	switch m.mode {
 	case chatNormalMode:
-		modeIndicator = dimStyle.Render(" [NORMAL]")
+		modeLabel = "Mode: NORMAL"
 	case chatInputMode:
-		modeIndicator = dimStyle.Render(" [INPUT]")
+		modeLabel = "Mode: INPUT"
 	}
 
 	currentModel := displayModelName(m.availableModels[m.selectedModelIdx])
@@ -1195,7 +1250,10 @@ func (m *chatViewModel) View() string {
 	if strings.TrimSpace(m.selectedPDF) != "" {
 		pdfName = filepath.Base(m.selectedPDF)
 	}
-	modelInfo := dimStyle.Render(fmt.Sprintf(" [%s] [history: %d] [pdf: %s] [skills: %d]", currentModel, m.historyCount, pdfName, len(m.selectedSkills)))
+	modelInfo := fmt.Sprintf("Model: %s", currentModel)
+	historyInfo := fmt.Sprintf("History: %d", m.historyCount)
+	pdfInfo := fmt.Sprintf("PDF: %s", pdfName)
+	skillsInfo := fmt.Sprintf("Skills: %d", len(m.selectedSkills))
 
 	helpText := ""
 	if m.mode == chatNormalMode {
@@ -1210,21 +1268,18 @@ func (m *chatViewModel) View() string {
 	textareaStyled := textareaAgentStyle(agent.AccentColor).Render(m.textarea.View())
 
 	mainContent := fmt.Sprintf(
-		"%s%s%s\n\n%s\n\n%s\n%s\n%s%s",
+		"%s\n\n%s\n\n%s\n%s\n%s",
 		headerStyle.Render(fmt.Sprintf("💬 %s", m.shared.selectedCtx.Name)),
-		modelInfo,
-		modeIndicator,
 		m.viewport.View(),
 		agentLabelStyle.Render(agentLabel),
 		textareaStyled,
-		helpStyle.Render(helpText),
 		status,
 	)
 	contentWidth := m.contentWidth()
 	mainRendered := lipgloss.NewStyle().Width(contentWidth).Render(mainContent)
 
 	if m.showUsagePanel {
-		panel := m.renderUsagePanel()
+		panel := m.renderUsagePanel(helpText, []string{modeLabel, modelInfo, historyInfo, pdfInfo, skillsInfo})
 		if panel != "" {
 			return lipgloss.JoinHorizontal(
 				lipgloss.Top,
@@ -1393,6 +1448,18 @@ func (m *chatViewModel) updateViewportContent() {
 		return
 	}
 
+	assistantBg := termenv.RGBColor("#202020")
+	bubbleWidth := m.viewport.Width - 2
+	if bubbleWidth < 24 {
+		bubbleWidth = 24
+	}
+	messagePadding := 2
+	contentWidth := bubbleWidth - (2 * messagePadding)
+	if contentWidth < 20 {
+		contentWidth = 20
+		bubbleWidth = contentWidth + (2 * messagePadding)
+	}
+
 	var b strings.Builder
 
 	for _, h := range m.history {
@@ -1408,27 +1475,39 @@ func (m *chatViewModel) updateViewportContent() {
 		}
 
 		if hasPrompt {
-			b.WriteString(pStyle.Render(fmt.Sprintf("%sYou: %s", archivedPrefix, h.Prompt)))
+			promptStyle := pStyle.Copy().Width(contentWidth)
+			b.WriteString(promptStyle.Render(fmt.Sprintf("%sYou: %s", archivedPrefix, h.Prompt)))
 			b.WriteString("\n\n")
 		}
 
-		rendered := renderMarkdown(h.Response, m.viewport.Width-4)
-		b.WriteString(rStyle.Render(rendered))
+		hasResponse := strings.TrimSpace(h.Response) != ""
+		if hasResponse {
+			rendered := renderMarkdown(h.Response, contentWidth)
+			if h.Archived {
+				b.WriteString(rStyle.Copy().Width(contentWidth).Render(rendered))
+			} else {
+				bgRendered := renderWithBackgroundAndPadding(rendered, contentWidth, messagePadding, assistantBg)
+				b.WriteString(bgRendered)
+			}
+		}
 		if len(h.ToolUse) > 0 {
-			b.WriteString("\n")
+			if hasResponse {
+				b.WriteString("\n")
+			}
 			b.WriteString(dimStyle.Render(renderToolUseSummary(h.ToolUse)))
 		}
-		b.WriteString("\n")
-		b.WriteString(dimStyle.Render(strings.Repeat("─", m.width)))
-		b.WriteString("\n\n")
+		if hasResponse || len(h.ToolUse) > 0 {
+			b.WriteString("\n\n")
+		}
 	}
 
 	if m.sending && m.currentResponse != "" {
-		b.WriteString(userPromptStyle.Render(fmt.Sprintf("You: %s", m.currentPrompt)))
+		b.WriteString(userPromptStyle.Copy().Width(contentWidth).Render(fmt.Sprintf("You: %s", m.currentPrompt)))
 		b.WriteString("\n\n")
 
-		rendered := renderMarkdown(m.currentResponse, m.viewport.Width-4)
-		b.WriteString(aiResponseStyle.Render(rendered))
+		rendered := renderMarkdown(m.currentResponse, contentWidth)
+		bgRendered := renderWithBackgroundAndPadding(rendered, contentWidth, messagePadding, assistantBg)
+		b.WriteString(bgRendered)
 		b.WriteString("\n")
 	}
 
@@ -1563,10 +1642,17 @@ func usageLines(u *commontypes.TokenUsage) []string {
 	}
 }
 
-func (m *chatViewModel) renderUsagePanel() string {
+func (m *chatViewModel) renderUsagePanel(helpText string, sessionInfo []string) string {
 	var b strings.Builder
+	b.WriteString(usagePanelTitleStyle.Render("Session"))
+	b.WriteString("\n")
+	for _, line := range sessionInfo {
+		b.WriteString(usageMetricValueStyle.Render(line))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
 	b.WriteString(usagePanelTitleStyle.Render("Token Usage"))
-	b.WriteString("\n\n")
+	b.WriteString("\n")
 	b.WriteString(usageMetricLabelStyle.Render("Context Total"))
 	b.WriteString("\n")
 	for _, line := range usageLines(&m.contextUsage) {
@@ -1580,8 +1666,32 @@ func (m *chatViewModel) renderUsagePanel() string {
 		b.WriteString(usageMetricValueStyle.Render(line))
 		b.WriteString("\n")
 	}
-	b.WriteString("\n" + usageMetricLabelStyle.Render("Toggle: ctrl+t"))
+	b.WriteString("\n")
+	b.WriteString(usageMetricLabelStyle.Render("Controls"))
+	b.WriteString("\n")
+	compactHelpStyle := helpStyle.Copy().MarginTop(0)
+	for _, item := range splitHelpItems(helpText) {
+		b.WriteString(compactHelpStyle.Render(item))
+		b.WriteString("\n")
+	}
+	b.WriteString(usageMetricLabelStyle.Render("Toggle: ctrl+t"))
 	return strings.TrimSuffix(b.String(), "\n")
+}
+
+func splitHelpItems(helpText string) []string {
+	parts := strings.Split(helpText, " • ")
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		items = append(items, trimmed)
+	}
+	if len(items) == 0 {
+		return []string{helpText}
+	}
+	return items
 }
 
 func (m *chatViewModel) scrollHalfPage(down bool) {

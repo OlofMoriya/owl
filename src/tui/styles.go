@@ -8,7 +8,6 @@ var (
 	panelColor     = lipgloss.Color("#242424")
 	accentColor    = lipgloss.Color("205")
 	errorColor     = lipgloss.Color("196")
-	panelBorder    = lipgloss.RoundedBorder()
 
 	headerStyle = lipgloss.NewStyle().
 			Bold(true).
@@ -39,23 +38,25 @@ var (
 			Foreground(errorColor).
 			Bold(true)
 
+	// Clean, borderless message blocks
 	userPromptStyle = lipgloss.NewStyle().
-			PaddingLeft(2).
-			Foreground(accentColor).
-			Bold(true)
+			Padding(1, 2).
+			Margin(0, 0, 1, 0).
+			Foreground(lipgloss.Color("230")).
+			Background(lipgloss.Color("#303030"))
 
 	aiResponseStyle = lipgloss.NewStyle().
-		// Background(panelColor).
-		PaddingLeft(2)
+			Padding(1, 2).
+			Margin(0, 0, 1, 0).
+			Foreground(lipgloss.Color("252"))
 
 	sendingStyle = lipgloss.NewStyle().
 			Foreground(primaryColor).
 			Bold(true).
 			Blink(true)
 
+	// Borderless right-side panel
 	usagePanelStyle = lipgloss.NewStyle().
-			Border(panelBorder, true).
-			BorderForeground(secondaryColor).
 			Padding(1, 2).
 			MarginLeft(2)
 
