@@ -6,14 +6,29 @@ import (
 )
 
 type RequestPayload struct {
-	Model  string `json:"model"`
-	Input  string `json:"input"`
-	Tools  []Tool `json:"tools"`
-	Stream *bool  `json:"stream,omitempty"`
+	Model  string      `json:"model"`
+	Input  interface{} `json:"input"`
+	Tools  []Tool      `json:"tools"`
+	Stream *bool       `json:"stream,omitempty"`
 }
 
 type Tool struct {
-	Type string `json:"type"`
+	Type        string                 `json:"type"`
+	Name        string                 `json:"name,omitempty"`
+	Description string                 `json:"description,omitempty"`
+	Parameters  map[string]interface{} `json:"parameters,omitempty"`
+}
+
+type InputMessage struct {
+	Type    string `json:"type"`
+	Role    string `json:"role,omitempty"`
+	Content string `json:"content,omitempty"`
+}
+
+type InputFunctionCallOutput struct {
+	Type   string `json:"type"`
+	CallID string `json:"call_id"`
+	Output string `json:"output"`
 }
 
 type WebSearchCall struct {
@@ -33,6 +48,17 @@ type WebFetchCall struct {
 }
 
 func (w WebFetchCall) GetType() string { return w.Type }
+
+type FunctionCall struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	CallID    string `json:"call_id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+	Status    string `json:"status,omitempty"`
+}
+
+func (f FunctionCall) GetType() string { return f.Type }
 
 type Delta struct {
 	Role    string `json:"role,omitempty"`
@@ -157,6 +183,13 @@ func (r *Response) UnmarshalJSON(data []byte) error {
 				return err
 			}
 			r.Output = append(r.Output, wf)
+
+		case "function_call":
+			var fc FunctionCall
+			if err := json.Unmarshal(raw, &fc); err != nil {
+				return err
+			}
+			r.Output = append(r.Output, fc)
 
 		default:
 			return fmt.Errorf("unknown output type: %s", typeCheck.Type)

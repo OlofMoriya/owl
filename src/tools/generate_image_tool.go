@@ -5,8 +5,6 @@ import (
 	commontypes "owl/common_types"
 	"owl/data"
 	"owl/logger"
-	open_ai_responses "owl/models/open-ai-responses"
-	"owl/services"
 
 	"github.com/fatih/color"
 )
@@ -36,17 +34,7 @@ func (tool *GenerateImageTool) Run(i map[string]string) (string, error) {
 
 	logger.Screen(fmt.Sprintf("Asked to generate image with prompt: %v", prompt), color.RGB(150, 150, 150))
 
-	toolHandler := ToolResponseHandler{
-		ResponseHandler: tool.ResponseHandler,
-	}
-	toolHandler.Init()
-
-	model := &open_ai_responses.OpenAiResponseModel{ResponseHandler: &toolHandler}
-
-	services.AwaitedQuery(prompt, model, *tool.HistoryRepository, 0, tool.Context, &commontypes.PayloadModifiers{}, MODELNAME)
-	//I need to await the answer on the channel toolHandler.ResponseChannel and then return with that value.
-	response := <-toolHandler.ResponseChannel
-	return response, nil
+	return "Image generation tool is temporarily unavailable while the model integration is being refactored.", nil
 }
 
 func (tool *GenerateImageTool) GetName() string {

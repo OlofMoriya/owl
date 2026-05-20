@@ -11,6 +11,8 @@ import (
 	commontypes "owl/common_types"
 	"owl/data"
 	"owl/logger"
+	"owl/mode"
+	"owl/tools"
 	"strings"
 	"time"
 
@@ -70,24 +72,47 @@ func createResponsePayload(prompt string, streaming bool, history []data.History
 		modelVersion = "gpt-5.4"
 	}
 
-	tools := []Tool{}
+	if modifiers == nil {
+		modifiers = &commontypes.PayloadModifiers{}
+	}
+
+	toolList := []Tool{}
 	if modifiers != nil {
 		if modifiers.Image {
-			tools = append(tools, Tool{Type: "image_generation"})
+			toolList = append(toolList, Tool{Type: "image_generation"})
 		}
 		if modifiers.Web {
-			tools = append(tools, Tool{Type: "web_search"})
-			tools = append(tools, Tool{Type: "web_fetch"})
+			toolList = append(toolList, Tool{Type: "web_search"})
+			toolList = append(toolList, Tool{Type: "web_fetch"})
 		}
 	}
-	if len(tools) == 0 {
-		tools = append(tools, Tool{Type: "image_generation"})
+
+	customTools := tools.GetCustomTools(mode.Mode, modifiers.ToolGroupFilters...)
+	for _, customTool := range customTools {
+		params := map[string]interface{}{
+			"type":       customTool.InputSchema.Type,
+			"properties": convertProperties(customTool.InputSchema.Properties),
+		}
+		if len(customTool.InputSchema.Required) > 0 {
+			params["required"] = customTool.InputSchema.Required
+		}
+		toolList = append(toolList, Tool{
+			Type:        "function",
+			Name:        customTool.Name,
+			Description: customTool.Description,
+			Parameters:  params,
+		})
 	}
+	if len(toolList) == 0 {
+		toolList = append(toolList, Tool{Type: "image_generation"})
+	}
+
+	input := buildInput(prompt, history, modifiers)
 
 	request := RequestPayload{
 		Model: modelVersion,
-		Input: prompt,
-		Tools: tools,
+		Input: input,
+		Tools: toolList,
 	}
 	if streaming {
 		stream := true
@@ -97,6 +122,76 @@ func createResponsePayload(prompt string, streaming bool, history []data.History
 	logger.Debug.Println("Will send payload")
 	logger.Debug.Printf("request %v", request)
 	return request
+}
+
+func buildInput(prompt string, history []data.History, modifiers *commontypes.PayloadModifiers) interface{} {
+	items := []interface{}{}
+
+	startIdx := len(history) - 5
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	for i := startIdx; i < len(history); i++ {
+		h := history[i]
+		if p := strings.TrimSpace(h.Prompt); p != "" {
+			items = append(items, InputMessage{Type: "message", Role: "user", Content: p})
+		}
+		if r := strings.TrimSpace(h.Response); r != "" {
+			items = append(items, InputMessage{Type: "message", Role: "assistant", Content: r})
+		}
+	}
+
+	for _, tr := range filterLocalToolUses(modifiers.ToolUses) {
+		callID := strings.TrimSpace(tr.Id)
+		if callID == "" {
+			continue
+		}
+		items = append(items, InputFunctionCallOutput{Type: "function_call_output", CallID: callID, Output: tr.Result.Content})
+	}
+
+	if p := strings.TrimSpace(prompt); p != "" {
+		items = append(items, InputMessage{Type: "message", Role: "user", Content: p})
+	}
+
+	if len(items) == 1 {
+		if single, ok := items[0].(InputMessage); ok && single.Role == "user" {
+			return single.Content
+		}
+	}
+
+	return items
+}
+
+func convertProperties(props map[string]tools.Property) map[string]interface{} {
+	result := make(map[string]interface{})
+	for key, prop := range props {
+		propMap := map[string]interface{}{"type": prop.Type}
+		if prop.Description != "" {
+			propMap["description"] = prop.Description
+		}
+		if len(prop.Properties) > 0 {
+			propMap["properties"] = convertProperties(prop.Properties)
+		}
+		if prop.Items != nil {
+			propMap["items"] = convertProperty(*prop.Items)
+		}
+		result[key] = propMap
+	}
+	return result
+}
+
+func convertProperty(prop tools.Property) map[string]interface{} {
+	propMap := map[string]interface{}{"type": prop.Type}
+	if prop.Description != "" {
+		propMap["description"] = prop.Description
+	}
+	if len(prop.Properties) > 0 {
+		propMap["properties"] = convertProperties(prop.Properties)
+	}
+	if prop.Items != nil {
+		propMap["items"] = convertProperty(*prop.Items)
+	}
+	return propMap
 }
 
 func (model *OpenAiResponseModel) HandleStreamedLine(line []byte) {
@@ -177,6 +272,7 @@ func (model *OpenAiResponseModel) HandleBodyBytes(byte_list []byte) {
 	text := ""
 	toolUses := []data.ToolUse{}
 	toolUseByID := map[string]int{}
+	functionToolOutput := ""
 
 	for _, output := range apiResponse.Output {
 		logger.Debug.Printf("%s", output)
@@ -255,6 +351,25 @@ func (model *OpenAiResponseModel) HandleBodyBytes(byte_list []byte) {
 			}
 			toolUseByID[v.ID] = len(toolUses)
 			toolUses = append(toolUses, toolUse)
+
+		case FunctionCall:
+			arguments := strings.TrimSpace(v.Arguments)
+			if arguments == "" || !json.Valid([]byte(arguments)) {
+				arguments = "{}"
+			}
+
+			inputArgs := map[string]string{}
+			if err := json.Unmarshal([]byte(arguments), &inputArgs); err != nil {
+				functionToolOutput += fmt.Sprintf("\nTool %s failed: Error parsing arguments: %v\n", v.Name, err)
+				continue
+			}
+
+			runner := tools.ToolRunner{Context: &data.Context{Id: model.contextId}}
+			result, err := runner.ExecuteTool(data.Context{Id: model.contextId}, v.Name, inputArgs)
+			if err != nil {
+				result = fmt.Sprintf("Error: %v", err)
+			}
+			functionToolOutput += fmt.Sprintf("\nTool %s result:\n%s\n", v.Name, result)
 		}
 	}
 
@@ -272,8 +387,28 @@ func (model *OpenAiResponseModel) HandleBodyBytes(byte_list []byte) {
 		}
 	}
 
+	if strings.TrimSpace(functionToolOutput) != "" {
+		if strings.TrimSpace(text) != "" {
+			text += "\n"
+		}
+		text += strings.TrimSpace(functionToolOutput)
+	}
+
 	logger.Debug.Printf("Final text from responses: %s", text)
 	model.ResponseHandler.FinalText(model.contextId, model.prompt, text, toolUses, model.modelName, nil)
+}
+
+func filterLocalToolUses(toolUses []data.ToolUse) []data.ToolUse {
+	if len(toolUses) == 0 {
+		return nil
+	}
+	localToolUses := make([]data.ToolUse, 0, len(toolUses))
+	for _, tu := range toolUses {
+		if tu.CallerType == "" || tu.CallerType == "assistant" {
+			localToolUses = append(localToolUses, tu)
+		}
+	}
+	return localToolUses
 }
 
 func (model *OpenAiResponseModel) SetResponseHandler(responseHandler commontypes.ResponseHandler) {

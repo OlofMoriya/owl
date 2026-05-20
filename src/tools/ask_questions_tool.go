@@ -41,7 +41,13 @@ func (tool *AskQuestionsTool) GetDefinition() (Tool, string) {
 						Properties: map[string]Property{
 							"id":             {Type: "string", Description: "Unique question id."},
 							"question":       {Type: "string", Description: "Question text."},
-							"options":        {Type: "array", Description: "Options as strings or objects with label."},
+							"options": {
+								Type:        "array",
+								Description: "Options as strings. Object options are also accepted at runtime for backward compatibility.",
+								Items: &Property{
+									Type: "string",
+								},
+							},
 							"allow_custom":   {Type: "boolean", Description: "Optional. Default true."},
 							"allow_multiple": {Type: "boolean", Description: "Optional. Default false."},
 							"required":       {Type: "boolean", Description: "Optional. Default true."},
