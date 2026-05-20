@@ -8,7 +8,7 @@ import (
 type RequestPayload struct {
 	Model  string      `json:"model"`
 	Input  interface{} `json:"input"`
-	Tools  []Tool      `json:"tools"`
+	Tools  []Tool      `json:"tools,omitempty"`
 	Stream *bool       `json:"stream,omitempty"`
 }
 
@@ -23,6 +23,13 @@ type InputMessage struct {
 	Type    string `json:"type"`
 	Role    string `json:"role,omitempty"`
 	Content string `json:"content,omitempty"`
+}
+
+type InputFunctionCall struct {
+	Type      string `json:"type"`
+	CallID    string `json:"call_id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type InputFunctionCallOutput struct {
@@ -111,6 +118,21 @@ type ImageGenerationCall struct {
 
 func (i ImageGenerationCall) GetType() string { return i.Type }
 
+// ReasoningSummaryItem represents individual summary text entries
+type ReasoningSummaryItem struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// ReasoningOutput represents a reasoning output block
+type ReasoningOutput struct {
+	ID      string                 `json:"id"`
+	Type    string                 `json:"type"`
+	Summary []ReasoningSummaryItem `json:"summary"`
+}
+
+func (ro ReasoningOutput) GetType() string { return ro.Type }
+
 // Message represents a message output
 type Message struct {
 	ID      string        `json:"id"`
@@ -130,21 +152,26 @@ type ContentItem struct {
 	Text        string        `json:"text"`
 }
 
-// Custom unmarshaling for Response
+// Custom unmarshaling for Response — uses alias to populate all fields,
+// then dispatches output items by type, skipping unknown types.
 func (r *Response) UnmarshalJSON(data []byte) error {
-	// First, unmarshal into a temporary structure
-	var temp struct {
+	// Alias avoids infinite recursion when calling Unmarshal on the same type.
+	type Alias Response
+	aux := &struct {
 		Output []json.RawMessage `json:"output"`
+		*Alias
+	}{
+		Alias: (*Alias)(r),
 	}
 
-	if err := json.Unmarshal(data, &temp); err != nil {
+	if err := json.Unmarshal(data, aux); err != nil {
 		return err
 	}
 
 	// Process each output item
-	r.Output = make([]OutputItem, 0, len(temp.Output))
+	r.Output = make([]OutputItem, 0, len(aux.Output))
 
-	for _, raw := range temp.Output {
+	for _, raw := range aux.Output {
 		// Peek at the type field
 		var typeCheck struct {
 			Type string `json:"type"`
@@ -154,7 +181,6 @@ func (r *Response) UnmarshalJSON(data []byte) error {
 			return err
 		}
 
-		// Unmarshal into the appropriate type
 		switch typeCheck.Type {
 		case "image_generation_call":
 			var img ImageGenerationCall
@@ -162,6 +188,13 @@ func (r *Response) UnmarshalJSON(data []byte) error {
 				return err
 			}
 			r.Output = append(r.Output, img)
+
+		case "reasoning":
+			var ro ReasoningOutput
+			if err := json.Unmarshal(raw, &ro); err != nil {
+				return err
+			}
+			r.Output = append(r.Output, ro)
 
 		case "message":
 			var msg Message
@@ -192,7 +225,8 @@ func (r *Response) UnmarshalJSON(data []byte) error {
 			r.Output = append(r.Output, fc)
 
 		default:
-			return fmt.Errorf("unknown output type: %s", typeCheck.Type)
+			// Skip truly unknown output types to stay forward-compatible
+			fmt.Printf("skipping unknown output type: %s\n", typeCheck.Type)
 		}
 	}
 
@@ -243,7 +277,3 @@ type ChatCompletionChunk struct {
 	SystemFingerprint string                      `json:"system_fingerprint"`
 	Choices           []ChatCompletionChunkChoice `json:"choices"`
 }
-
-// model="gpt-5"
-//     input="Generate an image of gray tabby cat hugging an otter with an orange scarf",
-//     tools=[{"type": "image_generation"}],

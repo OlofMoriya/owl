@@ -12,6 +12,7 @@ import (
 	"owl/data"
 	"owl/logger"
 	"owl/mode"
+	"owl/services"
 	"owl/tools"
 	"strings"
 	"time"
@@ -21,13 +22,26 @@ import (
 
 var MODELNAME = "open_ai_responses"
 
+// StreamedFunctionCall tracks a function call being accumulated during streaming
+type StreamedFunctionCall struct {
+	ID        string
+	CallID    string
+	Name      string
+	Arguments string
+}
+
 type OpenAiResponseModel struct {
-	ResponseHandler   commontypes.ResponseHandler
-	prompt            string
-	accumulatedAnswer string
-	contextId         int64
-	modelName         string
-	ModelVersion      string
+	HistoryRepository     data.HistoryRepository
+	ResponseHandler       commontypes.ResponseHandler
+	prompt                string
+	accumulatedAnswer     string
+	contextId             int64
+	modelName             string
+	ModelVersion          string
+	Modifiers             *commontypes.PayloadModifiers
+	currentFunctionCall   *StreamedFunctionCall
+	streamedFunctionCalls []StreamedFunctionCall
+	streamedToolUses      []data.ToolUse
 }
 
 func (model *OpenAiResponseModel) CreateRequest(context *data.Context, prompt string, streaming bool, history []data.History, modifiers *commontypes.PayloadModifiers) *http.Request {
@@ -36,6 +50,10 @@ func (model *OpenAiResponseModel) CreateRequest(context *data.Context, prompt st
 	model.accumulatedAnswer = ""
 	model.contextId = context.Id
 	model.modelName = payload.Model
+	model.Modifiers = modifiers
+	model.currentFunctionCall = nil
+	model.streamedFunctionCalls = nil
+	model.streamedToolUses = nil
 	return createRequest(payload)
 }
 
@@ -47,7 +65,7 @@ func createRequest(payload RequestPayload) *http.Request {
 
 	jsonpayload, err := json.Marshal(payload)
 	logger.Debug.Println("Will send payload")
-	logger.Debug.Println(jsonpayload)
+	logger.Debug.Println(string(jsonpayload))
 	if err != nil {
 		panic("failed to marshal payload")
 	}
@@ -103,16 +121,15 @@ func createResponsePayload(prompt string, streaming bool, history []data.History
 			Parameters:  params,
 		})
 	}
-	if len(toolList) == 0 {
-		toolList = append(toolList, Tool{Type: "image_generation"})
-	}
 
 	input := buildInput(prompt, history, modifiers)
 
 	request := RequestPayload{
 		Model: modelVersion,
 		Input: input,
-		Tools: toolList,
+	}
+	if len(toolList) > 0 {
+		request.Tools = toolList
 	}
 	if streaming {
 		stream := true
@@ -146,6 +163,16 @@ func buildInput(prompt string, history []data.History, modifiers *commontypes.Pa
 		if callID == "" {
 			continue
 		}
+		
+		// Add the function call first
+		items = append(items, InputFunctionCall{
+			Type:      "function_call",
+			CallID:    callID,
+			Name:      tr.Name,
+			Arguments: tr.Input,
+		})
+		
+		// Then add its output
 		items = append(items, InputFunctionCallOutput{Type: "function_call_output", CallID: callID, Output: tr.Result.Content})
 	}
 
@@ -197,45 +224,198 @@ func convertProperty(prop tools.Property) map[string]interface{} {
 func (model *OpenAiResponseModel) HandleStreamedLine(line []byte) {
 	responseLine := string(line)
 
+	logger.Debug.Printf("streamed raw line: %s", strings.TrimSpace(responseLine))
+
 	if strings.HasPrefix(responseLine, "data: ") {
-		data, _ := strings.CutPrefix(responseLine, "data: ")
-		data = strings.TrimSpace(data)
-		if data == "" || data == "[DONE]" {
+		responseData, _ := strings.CutPrefix(responseLine, "data: ")
+		responseData = strings.TrimSpace(responseData)
+		if responseData == "" || responseData == "[DONE]" {
+			logger.Debug.Printf("streamed: empty data or [DONE]")
 			return
 		}
 
 		var event map[string]interface{}
-		if err := json.Unmarshal([]byte(data), &event); err != nil {
+		if err := json.Unmarshal([]byte(responseData), &event); err != nil {
+			logger.Debug.Printf("streamed: JSON unmarshal error: %v (data: %.200s)", err, responseData)
 			return
 		}
 
 		eventType, _ := event["type"].(string)
+		logger.Debug.Printf("streamed event type: %s", eventType)
+
 		switch eventType {
-		case "response.output_text.delta", "response.refusal.delta", "response.reasoning_summary_text.delta", "response.content_part.added":
+		case "response.output_text.delta", "response.refusal.delta", "response.content_part.added":
 			text := extractEventText(event)
 			if text != "" {
 				model.accumulatedAnswer += text
 				model.ResponseHandler.RecievedText(text, nil)
 			}
 
-		case "response.output_text.done", "response.completed":
+		case "response.reasoning_summary_text.delta":
+			text := extractEventText(event)
+			if text != "" {
+				grey := "grey"
+				model.accumulatedAnswer += text
+				model.ResponseHandler.RecievedText(text, &grey)
+			}
+
+		case "response.output_item.added":
+			// A new output item is starting — check if it's a function call
+			if item, ok := event["item"].(map[string]interface{}); ok {
+				itemType, _ := item["type"].(string)
+				logger.Debug.Printf("streamed output_item.added type: %s", itemType)
+				if itemType == "function_call" {
+					fc := &StreamedFunctionCall{}
+					if id, ok := item["id"].(string); ok {
+						fc.ID = id
+					}
+					if callID, ok := item["call_id"].(string); ok {
+						fc.CallID = callID
+					}
+					if name, ok := item["name"].(string); ok {
+						fc.Name = name
+					}
+					model.currentFunctionCall = fc
+					logger.Debug.Printf("streaming function call started: %s (call_id: %s)", fc.Name, fc.CallID)
+				}
+			}
+
+		case "response.function_call_arguments.delta":
+			if model.currentFunctionCall != nil {
+				if delta, ok := event["delta"].(string); ok {
+					model.currentFunctionCall.Arguments += delta
+				}
+			}
+
+		case "response.function_call_arguments.done":
+			if model.currentFunctionCall != nil {
+				// Use the final arguments if provided
+				if args, ok := event["arguments"].(string); ok {
+					model.currentFunctionCall.Arguments = args
+				}
+				model.streamedFunctionCalls = append(model.streamedFunctionCalls, *model.currentFunctionCall)
+				logger.Debug.Printf("streaming function call done: %s args=%s", model.currentFunctionCall.Name, model.currentFunctionCall.Arguments)
+				model.currentFunctionCall = nil
+			}
+
+		case "response.output_text.done":
+			logger.Debug.Printf("streamed: output_text.done")
 			if text := extractEventText(event); text != "" && !strings.Contains(model.accumulatedAnswer, text) {
 				model.accumulatedAnswer += text
 			}
-			if eventType == "response.completed" {
-				model.ResponseHandler.FinalText(model.contextId, model.prompt, model.accumulatedAnswer, nil, model.modelName, nil)
+
+		case "response.completed":
+			logger.Debug.Printf("streamed: response.completed, accumulated %d chars, %d pending function calls", len(model.accumulatedAnswer), len(model.streamedFunctionCalls))
+
+			if text := extractEventText(event); text != "" && !strings.Contains(model.accumulatedAnswer, text) {
+				model.accumulatedAnswer += text
 			}
+
+			// Execute any accumulated function calls and do follow-up
+			localToolUses := model.executeStreamedFunctionCalls()
+			logger.Debug.Printf("streamed: executed %d function calls", len(localToolUses))
+
+			model.ResponseHandler.FinalText(model.contextId, model.prompt, model.accumulatedAnswer, localToolUses, model.modelName, nil)
+			logger.Debug.Printf("streamed: FinalText sent")
+
+			if len(localToolUses) > 0 {
+				logger.Debug.Printf("streamed: sending follow-up AwaitedQuery with %d tool results", len(localToolUses))
+				modifiers := &commontypes.PayloadModifiers{
+					ToolUses: localToolUses,
+				}
+				if model.Modifiers != nil {
+					modifiers.ToolGroupFilters = model.Modifiers.ToolGroupFilters
+				}
+				services.AwaitedQuery("", model, model.HistoryRepository, services.DefaultHistoryCount, &data.Context{Id: model.contextId}, modifiers, model.modelName)
+				logger.Debug.Printf("streamed: follow-up AwaitedQuery returned")
+			}
+
+			model.streamedFunctionCalls = nil
 
 		case "response.error":
 			if msg, ok := event["message"].(string); ok && strings.TrimSpace(msg) != "" {
+				logger.Debug.Printf("streamed: error event: %s", msg)
 				model.ResponseHandler.RecievedText("\nError: "+msg+"\n", nil)
 			}
 			model.ResponseHandler.FinalText(model.contextId, model.prompt, model.accumulatedAnswer, nil, model.modelName, nil)
 
 		default:
 			// Ignore unknown event types to remain resilient.
+			logger.Debug.Printf("streamed: ignoring event type: %s", eventType)
 		}
 	}
+}
+
+// executeStreamedFunctionCalls runs all accumulated function calls from streaming
+// and returns the tool use records for follow-up.
+func (model *OpenAiResponseModel) executeStreamedFunctionCalls() []data.ToolUse {
+	if len(model.streamedFunctionCalls) == 0 {
+		return nil
+	}
+
+	localToolUses := []data.ToolUse{}
+
+	for _, fc := range model.streamedFunctionCalls {
+		logger.Debug.Printf("executing streamed function call: %s (call_id: %s)", fc.Name, fc.CallID)
+		arguments := strings.TrimSpace(fc.Arguments)
+		if arguments == "" || !json.Valid([]byte(arguments)) {
+			arguments = "{}"
+		}
+
+		inputArgs := parseToolArguments(arguments)
+
+		runner := tools.ToolRunner{
+			ResponseHandler:   &model.ResponseHandler,
+			HistoryRepository: &model.HistoryRepository,
+			Context:           &data.Context{Id: model.contextId},
+		}
+		result, err := runner.ExecuteTool(data.Context{Id: model.contextId}, fc.Name, inputArgs)
+		if err != nil {
+			result = fmt.Sprintf("Error: %v", err)
+			logger.Debug.Printf("streamed tool %s error: %v", fc.Name, err)
+		} else {
+			logger.Debug.Printf("streamed tool %s completed, result length: %d", fc.Name, len(result))
+		}
+
+		toolUse := data.ToolUse{
+			Id:         fc.CallID,
+			Name:       fc.Name,
+			Input:      arguments,
+			CallerType: "assistant",
+			Result: data.ToolResult{
+				ToolUseId: fc.CallID,
+				Content:   result,
+				Success:   err == nil,
+			},
+		}
+		localToolUses = append(localToolUses, toolUse)
+	}
+
+	return localToolUses
+}
+
+// parseToolArguments converts JSON arguments to map[string]string for ExecuteTool
+func parseToolArguments(arguments string) map[string]string {
+	var rawArgs map[string]interface{}
+	if err := json.Unmarshal([]byte(arguments), &rawArgs); err != nil {
+		return map[string]string{}
+	}
+
+	inputArgs := map[string]string{}
+	for key, value := range rawArgs {
+		switch val := value.(type) {
+		case string:
+			inputArgs[key] = val
+		default:
+			bytes, err := json.Marshal(val)
+			if err != nil {
+				inputArgs[key] = fmt.Sprintf("%v", val)
+			} else {
+				inputArgs[key] = string(bytes)
+			}
+		}
+	}
+	return inputArgs
 }
 
 func extractEventText(event map[string]interface{}) string {
@@ -263,19 +443,22 @@ func extractEventText(event map[string]interface{}) string {
 }
 
 func (model *OpenAiResponseModel) HandleBodyBytes(byte_list []byte) {
+	logger.Debug.Printf("HandleBodyBytes called, %d bytes", len(byte_list))
 	var apiResponse Response
 	if err := json.Unmarshal(byte_list, &apiResponse); err != nil {
-		// Handle error, maybe return or log
+		logger.Debug.Printf("HandleBodyBytes: unmarshal error: %v", err)
 		println(fmt.Sprintf("Error unmarshalling response body: %v\n", err))
 	}
 
+	logger.Debug.Printf("HandleBodyBytes: %d output items", len(apiResponse.Output))
+
 	text := ""
 	toolUses := []data.ToolUse{}
+	localToolUses := []data.ToolUse{}
 	toolUseByID := map[string]int{}
-	functionToolOutput := ""
 
 	for _, output := range apiResponse.Output {
-		logger.Debug.Printf("%s", output)
+		logger.Debug.Printf("HandleBodyBytes output type: %s", output.GetType())
 		switch v := output.(type) {
 		case ImageGenerationCall:
 			unbased, err := base64.StdEncoding.DecodeString(v.Result)
@@ -303,6 +486,16 @@ func (model *OpenAiResponseModel) HandleBodyBytes(byte_list []byte) {
 			}
 
 			text += fmt.Sprintf("\n![Image](%s)\n", filename)
+
+		case ReasoningOutput:
+			for _, summary := range v.Summary {
+				if summary.Text != "" {
+					grey := "grey"
+					model.ResponseHandler.RecievedText(summary.Text, &grey)
+					model.ResponseHandler.RecievedText("\n", &grey)
+					text += summary.Text + "\n"
+				}
+			}
 
 		case Message:
 			for i, content := range v.Content {
@@ -358,18 +551,33 @@ func (model *OpenAiResponseModel) HandleBodyBytes(byte_list []byte) {
 				arguments = "{}"
 			}
 
-			inputArgs := map[string]string{}
-			if err := json.Unmarshal([]byte(arguments), &inputArgs); err != nil {
-				functionToolOutput += fmt.Sprintf("\nTool %s failed: Error parsing arguments: %v\n", v.Name, err)
-				continue
-			}
+			inputArgs := parseToolArguments(arguments)
 
-			runner := tools.ToolRunner{Context: &data.Context{Id: model.contextId}}
+			logger.Debug.Printf("HandleBodyBytes: executing function call %s (call_id: %s)", v.Name, v.CallID)
+			runner := tools.ToolRunner{
+				ResponseHandler:   &model.ResponseHandler,
+				HistoryRepository: &model.HistoryRepository,
+				Context:           &data.Context{Id: model.contextId},
+			}
 			result, err := runner.ExecuteTool(data.Context{Id: model.contextId}, v.Name, inputArgs)
 			if err != nil {
 				result = fmt.Sprintf("Error: %v", err)
 			}
-			functionToolOutput += fmt.Sprintf("\nTool %s result:\n%s\n", v.Name, result)
+			logger.Debug.Printf("HandleBodyBytes: function call %s done, result length: %d", v.Name, len(result))
+
+			toolUse := data.ToolUse{
+				Id:         v.CallID,
+				Name:       v.Name,
+				Input:      arguments,
+				CallerType: "assistant",
+				Result: data.ToolResult{
+					ToolUseId: v.CallID,
+					Content:   result,
+					Success:   err == nil,
+				},
+			}
+			toolUses = append(toolUses, toolUse)
+			localToolUses = append(localToolUses, toolUse)
 		}
 	}
 
@@ -387,15 +595,22 @@ func (model *OpenAiResponseModel) HandleBodyBytes(byte_list []byte) {
 		}
 	}
 
-	if strings.TrimSpace(functionToolOutput) != "" {
-		if strings.TrimSpace(text) != "" {
-			text += "\n"
-		}
-		text += strings.TrimSpace(functionToolOutput)
-	}
-
 	logger.Debug.Printf("Final text from responses: %s", text)
 	model.ResponseHandler.FinalText(model.contextId, model.prompt, text, toolUses, model.modelName, nil)
+
+	// If there were local function calls, send the results back to the model
+	// so it can produce a final answer based on tool output.
+	if len(localToolUses) > 0 {
+		logger.Debug.Printf("HandleBodyBytes: sending follow-up AwaitedQuery with %d tool results", len(localToolUses))
+		modifiers := &commontypes.PayloadModifiers{
+			ToolUses: localToolUses,
+		}
+		if model.Modifiers != nil {
+			modifiers.ToolGroupFilters = model.Modifiers.ToolGroupFilters
+		}
+		services.AwaitedQuery("", model, model.HistoryRepository, services.DefaultHistoryCount, &data.Context{Id: model.contextId}, modifiers, model.modelName)
+		logger.Debug.Printf("HandleBodyBytes: follow-up AwaitedQuery returned")
+	}
 }
 
 func filterLocalToolUses(toolUses []data.ToolUse) []data.ToolUse {
