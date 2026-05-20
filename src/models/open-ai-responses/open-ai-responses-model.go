@@ -45,7 +45,7 @@ type OpenAiResponseModel struct {
 }
 
 func (model *OpenAiResponseModel) CreateRequest(context *data.Context, prompt string, streaming bool, history []data.History, modifiers *commontypes.PayloadModifiers) *http.Request {
-	payload := createResponsePayload(prompt, streaming, history, modifiers, model.ModelVersion)
+	payload := createResponsePayload(context, prompt, streaming, history, modifiers, model.ModelVersion)
 	model.prompt = prompt
 	model.accumulatedAnswer = ""
 	model.contextId = context.Id
@@ -82,7 +82,7 @@ func createRequest(payload RequestPayload) *http.Request {
 	return req
 }
 
-func createResponsePayload(prompt string, streaming bool, history []data.History, modifiers *commontypes.PayloadModifiers, requestedModel string) RequestPayload {
+func createResponsePayload(context *data.Context, prompt string, streaming bool, history []data.History, modifiers *commontypes.PayloadModifiers, requestedModel string) RequestPayload {
 	modelVersion := "gpt-5.3-chat-latest"
 	if requestedModel == "gpt-5.5" {
 		modelVersion = "gpt-5.5"
@@ -122,7 +122,7 @@ func createResponsePayload(prompt string, streaming bool, history []data.History
 		})
 	}
 
-	input := buildInput(prompt, history, modifiers)
+	input := buildInput(context, prompt, history, modifiers)
 
 	request := RequestPayload{
 		Model: modelVersion,
@@ -141,44 +141,146 @@ func createResponsePayload(prompt string, streaming bool, history []data.History
 	return request
 }
 
-func buildInput(prompt string, history []data.History, modifiers *commontypes.PayloadModifiers) interface{} {
-	items := []interface{}{}
-
-	startIdx := len(history) - 5
-	if startIdx < 0 {
-		startIdx = 0
+// getFirstNWords returns the first N words from a string
+func getFirstNWords(text string, n int) string {
+	words := strings.Fields(text)
+	if len(words) <= n {
+		return text
 	}
+	return strings.Join(words[:n], " ") + "..."
+}
+
+func buildInput(context *data.Context, prompt string, history []data.History, modifiers *commontypes.PayloadModifiers) interface{} {
+	logger.Debug.Println("========================================")
+	logger.Debug.Println("Building payload input - conversation structure:")
+	logger.Debug.Println("========================================")
+
+	if modifiers == nil {
+		modifiers = &commontypes.PayloadModifiers{}
+	}
+
+	items := []interface{}{}
+	replayedToolUseIDs := map[string]bool{}
+
+	if context != nil {
+		systemPrompt := strings.TrimSpace(context.SystemPrompt)
+		if systemPrompt != "" {
+			items = append(items, InputMessage{Type: "message", Role: "developer", Content: systemPrompt})
+			logger.Debug.Printf("DEVELOPER: %s", getFirstNWords(systemPrompt, 5))
+		}
+	}
+
+	startIdx := 0
+	logger.Debug.Printf("Processing %d history entries (from index %d to %d)", len(history)-startIdx, startIdx, len(history)-1)
+
+	// Process history (including tool results)
 	for i := startIdx; i < len(history); i++ {
 		h := history[i]
+
+		// Add user prompt
 		if p := strings.TrimSpace(h.Prompt); p != "" {
 			items = append(items, InputMessage{Type: "message", Role: "user", Content: p})
+			logger.Debug.Printf("USER: %s", getFirstNWords(p, 5))
 		}
-		if r := strings.TrimSpace(h.Response); r != "" {
-			items = append(items, InputMessage{Type: "message", Role: "assistant", Content: r})
+
+		// Check if this history entry has tool uses
+		localTools := filterLocalToolUses(h.ToolUse)
+		if len(localTools) > 0 {
+			logger.Debug.Printf("  (has %d tool uses)", len(localTools))
+			// This history entry involved tool calls - render them as function_call + function_call_output items
+			for _, tu := range localTools {
+				callID := strings.TrimSpace(tu.Id)
+				if callID == "" {
+					continue
+				}
+
+				// Add the function call
+				items = append(items, InputFunctionCall{
+					Type:      "function_call",
+					CallID:    callID,
+					Name:      tu.Name,
+					Arguments: tu.Input,
+				})
+				logger.Debug.Printf("  FUNCTION_CALL: %s (id: %s)", tu.Name, callID)
+
+				// Add the function call output
+				items = append(items, InputFunctionCallOutput{
+					Type:   "function_call_output",
+					CallID: callID,
+					Output: tu.Result.Content,
+				})
+				resultPreview := getFirstNWords(tu.Result.Content, 5)
+				logger.Debug.Printf("  FUNCTION_OUTPUT: %s", resultPreview)
+
+				// Track that we've replayed this tool use
+				replayedToolUseIDs[tu.Id] = true
+			}
+
+			// Add assistant's final response if any (after processing tools)
+			if r := strings.TrimSpace(h.Response); r != "" {
+				items = append(items, InputMessage{Type: "message", Role: "assistant", Content: r})
+				logger.Debug.Printf("ASSISTANT: %s", getFirstNWords(r, 5))
+			}
+		} else {
+			// No tool uses - just add the assistant response as text
+			if r := strings.TrimSpace(h.Response); r != "" {
+				items = append(items, InputMessage{Type: "message", Role: "assistant", Content: r})
+				logger.Debug.Printf("ASSISTANT: %s", getFirstNWords(r, 5))
+			}
 		}
 	}
 
-	for _, tr := range filterLocalToolUses(modifiers.ToolUses) {
-		callID := strings.TrimSpace(tr.Id)
-		if callID == "" {
-			continue
+	// Add tool responses from modifiers if this is a continuation (follow-up query)
+	// Only add tools that haven't already been replayed from history
+	modifierLocalToolUses := filterLocalToolUses(modifiers.ToolUses)
+	if len(modifierLocalToolUses) > 0 {
+		logger.Debug.Printf("Processing %d tool uses from modifiers", len(modifierLocalToolUses))
+		addedToolResponses := 0
+		for _, tr := range modifierLocalToolUses {
+			if replayedToolUseIDs[tr.Id] {
+				logger.Debug.Printf("  Skipping tool %s (id: %s) - already in history", tr.Name, tr.Id)
+				continue // Skip - already in history
+			}
+
+			callID := strings.TrimSpace(tr.Id)
+			if callID == "" {
+				continue
+			}
+
+			// Add the function call
+			items = append(items, InputFunctionCall{
+				Type:      "function_call",
+				CallID:    callID,
+				Name:      tr.Name,
+				Arguments: tr.Input,
+			})
+			logger.Debug.Printf("  FUNCTION_CALL: %s (id: %s)", tr.Name, callID)
+
+			// Add the function call output
+			items = append(items, InputFunctionCallOutput{
+				Type:   "function_call_output",
+				CallID: callID,
+				Output: tr.Result.Content,
+			})
+			resultPreview := getFirstNWords(tr.Result.Content, 5)
+			logger.Debug.Printf("  FUNCTION_OUTPUT: %s", resultPreview)
+
+			addedToolResponses++
 		}
-		
-		// Add the function call first
-		items = append(items, InputFunctionCall{
-			Type:      "function_call",
-			CallID:    callID,
-			Name:      tr.Name,
-			Arguments: tr.Input,
-		})
-		
-		// Then add its output
-		items = append(items, InputFunctionCallOutput{Type: "function_call_output", CallID: callID, Output: tr.Result.Content})
+		if addedToolResponses > 0 {
+			logger.Debug.Printf("Added %d tool responses to payload", addedToolResponses)
+		}
 	}
 
+	// Add current prompt if provided
 	if p := strings.TrimSpace(prompt); p != "" {
 		items = append(items, InputMessage{Type: "message", Role: "user", Content: p})
+		logger.Debug.Printf("USER (current): %s", getFirstNWords(p, 5))
 	}
+
+	logger.Debug.Printf("========================================")
+	logger.Debug.Printf("Total items in payload: %d", len(items))
+	logger.Debug.Println("========================================")
 
 	if len(items) == 1 {
 		if single, ok := items[0].(InputMessage); ok && single.Role == "user" {
