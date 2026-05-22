@@ -20,6 +20,22 @@ var awaitedQueryHook awaitedQueryFunc = awaitedQueryImplementation
 
 const DefaultHistoryCount = 1000
 
+func buildHTTPStatusError(statusCode int, responseBody []byte) error {
+	body := strings.TrimSpace(string(responseBody))
+	if body == "" {
+		return fmt.Errorf("received non-OK response status: %d", statusCode)
+	}
+	return fmt.Errorf("received non-OK response status: %d body: %s", statusCode, body)
+}
+
+func looksLikeSSEBody(body []byte) bool {
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return false
+	}
+	return strings.HasPrefix(trimmed, "event:") || strings.HasPrefix(trimmed, "data:")
+}
+
 // SetAwaitedQueryHook overrides the default awaited query behavior (used in tests)
 func SetAwaitedQueryHook(fn awaitedQueryFunc) {
 	if fn == nil {
@@ -67,6 +83,9 @@ func awaitedQueryImplementation(prompt string, model commontypes.Model, historyR
 
 	req := model.CreateRequest(context, prompt, false, history, modifiers)
 	logger.Debug.Printf("sending req: %v", req)
+	if authSource := strings.TrimSpace(req.Header.Get("X-Owl-Auth-Source")); authSource != "" {
+		logger.Debug.Printf("query auth source: %s", authSource)
+	}
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -85,7 +104,7 @@ func awaitedQueryImplementation(prompt string, model commontypes.Model, historyR
 		logger.Debug.Printf("Issue from llm: %s", string(bytes))
 		logger.Debug.Printf("received non-OK response status: %d", resp.StatusCode)
 		logger.Debug.Printf("\nerr: %v", err)
-		panic(fmt.Errorf("received non-OK response status: %d", resp.StatusCode))
+		panic(buildHTTPStatusError(resp.StatusCode, bytes))
 	}
 
 	logger.Debug.Printf("statusCode: %d", resp.StatusCode)
@@ -98,6 +117,13 @@ func awaitedQueryImplementation(prompt string, model commontypes.Model, historyR
 
 	logger.Debug.Println("Received a response without streaming")
 	logger.Debug.Printf("bodyBytes %s", string(bodyBytes))
+	if looksLikeSSEBody(bodyBytes) {
+		logger.Debug.Println("awaited query returned SSE body; replaying lines through stream handler")
+		for _, line := range strings.Split(string(bodyBytes), "\n") {
+			model.HandleStreamedLine([]byte(line + "\n"))
+		}
+		return
+	}
 
 	model.HandleBodyBytes(bodyBytes)
 
@@ -130,6 +156,9 @@ func StreamedQuery(prompt string, model commontypes.Model, historyRepository dat
 	)
 
 	req := model.CreateRequest(context, prompt, true, validHistory, modifiers)
+	if authSource := strings.TrimSpace(req.Header.Get("X-Owl-Auth-Source")); authSource != "" {
+		logger.Debug.Printf("streamed query auth source: %s", authSource)
+	}
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -140,9 +169,13 @@ func StreamedQuery(prompt string, model commontypes.Model, historyRepository dat
 
 	if resp.StatusCode != http.StatusOK {
 		bytes, _ := io.ReadAll(resp.Body)
-		println("bytes", string(bytes))
+		wwwAuth := strings.TrimSpace(resp.Header.Get("WWW-Authenticate"))
+		if wwwAuth != "" {
+			logger.Debug.Printf("streamed query non-OK WWW-Authenticate: %s", wwwAuth)
+		}
+		logger.Debug.Printf("streamed query non-OK status=%d body=%s", resp.StatusCode, string(bytes))
 
-		panic(fmt.Errorf("received non-OK response status: %d", resp.StatusCode))
+		panic(buildHTTPStatusError(resp.StatusCode, bytes))
 	}
 
 	reader := bufio.NewReader(resp.Body)

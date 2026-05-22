@@ -2,11 +2,18 @@ package openai_auth
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	callback "owl/http/callback"
+	"owl/logger"
 	"path/filepath"
 	"strings"
 	"time"
@@ -16,9 +23,15 @@ const (
 	openAIOAuthClientID   = "app_EMoamEEZ73f0CkXaXp7hrann"
 	openAIOAuthIssuer     = "https://auth.openai.com"
 	openAIOAuthTokenURL   = "https://auth.openai.com/oauth/token"
+	openAIOAuthAuthorize  = "https://auth.openai.com/oauth/authorize"
 	openAIOAuthEarlySkew  = 60 * 1000
-	openAIOAuthPollMargin = 3 * time.Second
 	openAIOAuthFilePath   = ".owl/auth/openai.json"
+	openCodeAuthFilePath  = ".local/share/opencode/auth.json"
+	openAIOAuthScope      = "openid profile email offline_access"
+	openAIOAuthOriginator = "owl"
+	oauthCallbackHost     = "127.0.0.1"
+	oauthCallbackPort     = 1455
+	oauthCallbackPath     = "/auth/callback"
 	openAIOAuthFilePerm   = 0o600
 	openAIOAuthFolderPerm = 0o700
 )
@@ -39,14 +52,21 @@ const (
 
 type oauthFile struct {
 	Type         string `json:"type"`
-	Access       string `json:"access"`
-	Refresh      string `json:"refresh"`
-	Expires      int64  `json:"expires"`
-	AccountID    string `json:"accountId"`
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	ExpiresAt    int64  `json:"expires_at"`
-	AccountIDAlt string `json:"account_id"`
+	AccountID    string `json:"account_id"`
+	AccountIDAlt string `json:"accountId,omitempty"`
+}
+
+type openCodeAuthFile struct {
+	OpenAI struct {
+		Type      string `json:"type"`
+		Access    string `json:"access"`
+		Refresh   string `json:"refresh"`
+		Expires   int64  `json:"expires"`
+		AccountID string `json:"accountId"`
+	} `json:"openai"`
 }
 
 type refreshResponse struct {
@@ -55,25 +75,15 @@ type refreshResponse struct {
 	ExpiresIn    int64  `json:"expires_in"`
 }
 
-type deviceCodeResponse struct {
-	DeviceAuthID string `json:"device_auth_id"`
-	UserCode     string `json:"user_code"`
-	Interval     string `json:"interval"`
-}
-
-type deviceTokenResponse struct {
-	AuthorizationCode string `json:"authorization_code"`
-	CodeVerifier      string `json:"code_verifier"`
-}
-
 type loginResult struct {
 	VerificationURL string
 	UserCode        string
 }
 
 type LoginSession struct {
-	device   deviceCodeResponse
-	interval time.Duration
+	state    string
+	verifier string
+	callback *callback.OAuthCallbackServer
 }
 
 var refreshToken = refreshTokenFromAPI
@@ -88,24 +98,33 @@ func Login() (string, error) {
 }
 
 func StartLogin() (loginResult, *LoginSession, error) {
-	result, session, err := startDeviceFlow()
-	if err != nil {
-		return loginResult{}, nil, err
-	}
-	return result, session, nil
+	return startPKCEFlow()
 }
 
 func CompleteLogin(result loginResult, session *LoginSession) (string, error) {
-	tokens, err := waitForDeviceAuthorization(session)
+	if session == nil {
+		return "", fmt.Errorf("login session missing")
+	}
+	defer session.callback.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	code, err := session.callback.WaitForCode(ctx)
+	if err != nil {
+		return "", fmt.Errorf("oauth callback failed: %w", err)
+	}
+
+	tokens, err := exchangeAuthorizationCode(code, session.verifier, callbackURL())
 	if err != nil {
 		return "", err
 	}
 
 	auth := oauthFile{
-		Type:      "oauth",
-		Access:    tokens.AccessToken,
-		Refresh:   tokens.RefreshToken,
-		AccountID: extractAccountID(tokens.AccessToken),
+		Type:         "oauth",
+		AccessToken:  tokens.AccessToken,
+		RefreshToken: tokens.RefreshToken,
+		AccountID:    extractAccountID(tokens.AccessToken),
 	}
 	auth.updateFromRefresh(tokens)
 
@@ -118,7 +137,7 @@ func CompleteLogin(result loginResult, session *LoginSession) (string, error) {
 		return "", err
 	}
 
-	return fmt.Sprintf("OpenAI login successful. Visit %s and enter code %s", result.VerificationURL, result.UserCode), nil
+	return fmt.Sprintf("OpenAI login successful. Visit %s", result.VerificationURL), nil
 }
 
 func Logout() error {
@@ -134,31 +153,79 @@ func Logout() error {
 }
 
 func Resolve() (ResolvedAuth, error) {
+	debugln("openai auth resolve: start")
 	oauth, path, err := loadOAuthFile()
 	if err == nil {
+		debugf(
+			"openai auth resolve: loaded oauth file path=%s type=%s has_access=%t has_refresh=%t expires_at_ms=%d account_id_present=%t",
+			path,
+			oauth.Type,
+			oauth.AccessToken != "",
+			oauth.RefreshToken != "",
+			oauth.expiresAt(),
+			oauth.resolvedAccountID() != "",
+		)
+		debugf("openai auth resolve: token fingerprint=%s", tokenFingerprint(oauth.AccessToken))
 		now := time.Now().UnixMilli()
-		expiresAt := oauth.expiresUnixMs()
-		if oauth.refreshToken() != "" && oauth.accessToken() != "" && now+openAIOAuthEarlySkew >= expiresAt {
-			refreshed, refreshErr := refreshToken(oauth.refreshToken())
+		expiresAt := oauth.expiresAt()
+		refreshNeeded := oauth.RefreshToken != "" && oauth.AccessToken != "" && now+openAIOAuthEarlySkew >= expiresAt
+		debugf(
+			"openai auth resolve: refresh decision now_ms=%d expires_at_ms=%d skew_ms=%d refresh_needed=%t",
+			now,
+			expiresAt,
+			openAIOAuthEarlySkew,
+			refreshNeeded,
+		)
+		if refreshNeeded {
+			oldFingerprint := tokenFingerprint(oauth.AccessToken)
+			oldExpiresAt := oauth.expiresAt()
+			debugf("openai auth resolve: refreshing token path=%s", path)
+			refreshed, refreshErr := refreshToken(oauth.RefreshToken)
 			if refreshErr != nil {
+				debugf("openai auth resolve: refresh failed path=%s err=%v", path, refreshErr)
 				return ResolvedAuth{}, fmt.Errorf("openai oauth refresh failed: %w", refreshErr)
 			}
 			oauth.updateFromRefresh(refreshed)
+			debugf(
+				"openai auth resolve: refresh success token_changed=%t expires_at_old=%d expires_at_new=%d new_fingerprint=%s",
+				oldFingerprint != tokenFingerprint(oauth.AccessToken),
+				oldExpiresAt,
+				oauth.expiresAt(),
+				tokenFingerprint(oauth.AccessToken),
+			)
 			if writeErr := writeOAuthFile(path, oauth); writeErr != nil {
+				debugf("openai auth resolve: persisted refresh failed path=%s err=%v", path, writeErr)
 				return ResolvedAuth{}, fmt.Errorf("openai oauth persist failed: %w", writeErr)
 			}
+			debugf("openai auth resolve: persisted refreshed token path=%s", path)
 		}
 
-		if oauth.accessToken() != "" {
-			return ResolvedAuth{Token: oauth.accessToken(), AccountID: oauth.accountID(), IsCodex: true}, nil
+		if oauth.AccessToken != "" {
+			accountID := oauth.resolvedAccountID()
+			debugf(
+				"openai auth resolve: selected_source=oauth source_path=%s selection_reason=oauth_file_present account_id_present=%t token_fingerprint=%s",
+				path,
+				strings.TrimSpace(accountID) != "",
+				tokenFingerprint(oauth.AccessToken),
+			)
+			return ResolvedAuth{Token: oauth.AccessToken, AccountID: accountID, IsCodex: true}, nil
 		}
+
+		debugf("openai auth resolve: oauth file path=%s had empty access token fallback_trigger=empty_access_token", path)
+	} else {
+		debugf("openai auth resolve: oauth file load failed err=%v fallback_trigger=oauth_file_unavailable", err)
 	}
 
 	apiKey, ok := os.LookupEnv("OPENAI_API_KEY")
 	if !ok || apiKey == "" {
+		debugln("openai auth resolve: no oauth and OPENAI_API_KEY missing")
 		return ResolvedAuth{}, fmt.Errorf("could not fetch OPENAI_API_KEY and no codex oauth token found")
 	}
 
+	debugf(
+		"openai auth resolve: selected_source=api_key selection_reason=oauth_unavailable_or_invalid token_fingerprint=%s",
+		tokenFingerprint(apiKey),
+	)
 	return ResolvedAuth{Token: apiKey, IsCodex: false}, nil
 }
 
@@ -167,7 +234,7 @@ func HasCodexOAuthCredential() bool {
 	if err != nil {
 		return false
 	}
-	return oauth.accessToken() != "" && oauth.refreshToken() != ""
+	return oauth.AccessToken != "" && oauth.RefreshToken != ""
 }
 
 func CurrentStatus() Status {
@@ -186,7 +253,18 @@ func loadOAuthFile() (oauthFile, string, error) {
 	if err != nil {
 		return oauthFile{}, "", err
 	}
+
+	openCodePath := filepath.Join(home, openCodeAuthFilePath)
+	debugf("openai auth resolve: checking opencode auth path=%s", openCodePath)
+	if auth, err := loadOpenCodeOAuthFile(openCodePath); err == nil {
+		debugf("openai auth resolve: using opencode auth file path=%s", openCodePath)
+		return auth, openCodePath, nil
+	} else {
+		debugf("openai auth resolve: opencode auth file unavailable path=%s err=%v", openCodePath, err)
+	}
+
 	path := filepath.Join(home, openAIOAuthFilePath)
+	debugf("openai auth resolve: checking owl auth path=%s", path)
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return oauthFile{}, path, err
@@ -197,7 +275,35 @@ func loadOAuthFile() (oauthFile, string, error) {
 		return oauthFile{}, path, err
 	}
 
+	if auth.AccountID == "" && auth.AccountIDAlt != "" {
+		auth.AccountID = auth.AccountIDAlt
+	}
+
 	return auth, path, nil
+}
+
+func loadOpenCodeOAuthFile(path string) (oauthFile, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return oauthFile{}, err
+	}
+
+	var authFile openCodeAuthFile
+	if err := json.Unmarshal(content, &authFile); err != nil {
+		return oauthFile{}, err
+	}
+
+	if strings.TrimSpace(authFile.OpenAI.Type) != "oauth" || strings.TrimSpace(authFile.OpenAI.Access) == "" {
+		return oauthFile{}, fmt.Errorf("opencode auth missing oauth access token")
+	}
+
+	return oauthFile{
+		Type:         authFile.OpenAI.Type,
+		AccessToken:  authFile.OpenAI.Access,
+		RefreshToken: authFile.OpenAI.Refresh,
+		ExpiresAt:    authFile.OpenAI.Expires,
+		AccountID:    authFile.OpenAI.AccountID,
+	}, nil
 }
 
 func writeOAuthFile(path string, auth oauthFile) error {
@@ -257,128 +363,54 @@ func refreshTokenFromAPI(refreshTok string) (refreshResponse, error) {
 	return out, nil
 }
 
-func startDeviceFlow() (loginResult, *LoginSession, error) {
-	deviceURL := openAIOAuthIssuer + "/api/accounts/deviceauth/usercode"
-
-	body := map[string]string{"client_id": openAIOAuthClientID}
-	encoded, err := json.Marshal(body)
+func startPKCEFlow() (loginResult, *LoginSession, error) {
+	state, err := randomHex(16)
+	if err != nil {
+		return loginResult{}, nil, err
+	}
+	verifier, err := randomBase64URL(32)
 	if err != nil {
 		return loginResult{}, nil, err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, deviceURL, bytes.NewBuffer(encoded))
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	callbackServer, err := callback.StartOAuthCallbackServer(oauthCallbackHost, oauthCallbackPort, state)
 	if err != nil {
-		return loginResult{}, nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return loginResult{}, nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return loginResult{}, nil, fmt.Errorf("device auth start failed with status %d", resp.StatusCode)
+		return loginResult{}, nil, fmt.Errorf("oauth callback server start failed: %w", err)
 	}
 
-	var device deviceCodeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&device); err != nil {
-		return loginResult{}, nil, err
-	}
-	if device.DeviceAuthID == "" || device.UserCode == "" {
-		return loginResult{}, nil, fmt.Errorf("device auth response missing fields")
-	}
+	u, _ := url.Parse(openAIOAuthAuthorize)
+	q := u.Query()
+	q.Set("response_type", "code")
+	q.Set("client_id", openAIOAuthClientID)
+	q.Set("redirect_uri", callbackURL())
+	q.Set("scope", openAIOAuthScope)
+	q.Set("code_challenge", challenge)
+	q.Set("code_challenge_method", "S256")
+	q.Set("state", state)
+	q.Set("id_token_add_organizations", "true")
+	q.Set("codex_cli_simplified_flow", "true")
+	q.Set("originator", openAIOAuthOriginator)
+	u.RawQuery = q.Encode()
 
-	interval := 5 * time.Second
-	if parsed, err := time.ParseDuration(device.Interval + "s"); err == nil && parsed > 0 {
-		interval = parsed
-	}
-
-	return loginResult{VerificationURL: openAIOAuthIssuer + "/codex/device", UserCode: device.UserCode}, &LoginSession{device: device, interval: interval}, nil
+	return loginResult{VerificationURL: u.String()}, &LoginSession{state: state, verifier: verifier, callback: callbackServer}, nil
 }
 
-func waitForDeviceAuthorization(session *LoginSession) (refreshResponse, error) {
-	if session == nil {
-		return refreshResponse{}, fmt.Errorf("login session missing")
-	}
-	statusURL := openAIOAuthIssuer + "/api/accounts/deviceauth/token"
-	for attempt := 0; attempt < 120; attempt++ {
-		tokens, done, err := pollDeviceToken(statusURL, session.device)
-		if err != nil {
-			return refreshResponse{}, err
-		}
-		if done {
-			return tokens, nil
-		}
-		time.Sleep(session.interval + openAIOAuthPollMargin)
-	}
+func exchangeAuthorizationCode(code string, verifier string, redirectURI string) (refreshResponse, error) {
+	body := url.Values{}
+	body.Set("grant_type", "authorization_code")
+	body.Set("code", code)
+	body.Set("redirect_uri", redirectURI)
+	body.Set("client_id", openAIOAuthClientID)
+	body.Set("code_verifier", verifier)
 
-	return refreshResponse{}, fmt.Errorf("device auth timed out")
-}
-
-func pollDeviceToken(statusURL string, device deviceCodeResponse) (refreshResponse, bool, error) {
-	body := map[string]string{
-		"device_auth_id": device.DeviceAuthID,
-		"user_code":      device.UserCode,
-	}
-	encoded, err := json.Marshal(body)
-	if err != nil {
-		return refreshResponse{}, false, err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, statusURL, bytes.NewBuffer(encoded))
-	if err != nil {
-		return refreshResponse{}, false, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return refreshResponse{}, false, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
-		return refreshResponse{}, false, nil
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return refreshResponse{}, false, fmt.Errorf("device auth poll failed with status %d", resp.StatusCode)
-	}
-
-	var tokenResp deviceTokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return refreshResponse{}, false, err
-	}
-	if tokenResp.AuthorizationCode == "" || tokenResp.CodeVerifier == "" {
-		return refreshResponse{}, false, fmt.Errorf("device auth token response missing fields")
-	}
-
-	tokens, err := exchangeAuthorizationCode(tokenResp.AuthorizationCode, tokenResp.CodeVerifier)
-	if err != nil {
-		return refreshResponse{}, false, err
-	}
-	return tokens, true, nil
-}
-
-func exchangeAuthorizationCode(code string, verifier string) (refreshResponse, error) {
-	body := map[string]string{
-		"grant_type":    "authorization_code",
-		"code":          code,
-		"redirect_uri":  openAIOAuthIssuer + "/deviceauth/callback",
-		"client_id":     openAIOAuthClientID,
-		"code_verifier": verifier,
-	}
-	encoded, err := json.Marshal(body)
+	req, err := http.NewRequest(http.MethodPost, openAIOAuthTokenURL, strings.NewReader(body.Encode()))
 	if err != nil {
 		return refreshResponse{}, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, openAIOAuthTokenURL, bytes.NewBuffer(encoded))
-	if err != nil {
-		return refreshResponse{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -398,6 +430,26 @@ func exchangeAuthorizationCode(code string, verifier string) (refreshResponse, e
 		return refreshResponse{}, fmt.Errorf("token exchange response missing token fields")
 	}
 	return out, nil
+}
+
+func callbackURL() string {
+	return fmt.Sprintf("http://localhost:%d%s", oauthCallbackPort, oauthCallbackPath)
+}
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func randomBase64URL(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 func extractAccountID(accessToken string) string {
@@ -437,45 +489,46 @@ func decodeBase64URL(raw []byte) ([]byte, error) {
 	return out[:n], nil
 }
 
-func (a oauthFile) accessToken() string {
-	if a.Access != "" {
-		return a.Access
-	}
-	return a.AccessToken
-}
-
-func (a oauthFile) refreshToken() string {
-	if a.Refresh != "" {
-		return a.Refresh
-	}
-	return a.RefreshToken
-}
-
-func (a oauthFile) expiresUnixMs() int64 {
-	if a.Expires > 0 {
-		return a.Expires
-	}
+func (a oauthFile) expiresAt() int64 {
 	return a.ExpiresAt
 }
 
-func (a oauthFile) accountID() string {
-	if a.AccountID != "" {
-		return a.AccountID
+func (a oauthFile) resolvedAccountID() string {
+	if strings.TrimSpace(a.AccountID) != "" {
+		return strings.TrimSpace(a.AccountID)
 	}
-	return a.AccountIDAlt
+	return strings.TrimSpace(a.AccountIDAlt)
+}
+
+func tokenFingerprint(token string) string {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return "none"
+	}
+	hash := sha256.Sum256([]byte(trimmed))
+	return hex.EncodeToString(hash[:6])
+}
+
+func debugln(msg string) {
+	if logger.Debug != nil {
+		logger.Debug.Println(msg)
+	}
+}
+
+func debugf(format string, args ...interface{}) {
+	if logger.Debug != nil {
+		logger.Debug.Printf(format, args...)
+	}
 }
 
 func (a *oauthFile) updateFromRefresh(refresh refreshResponse) {
-	a.Access = refresh.AccessToken
 	a.AccessToken = refresh.AccessToken
 	if refresh.RefreshToken != "" {
-		a.Refresh = refresh.RefreshToken
 		a.RefreshToken = refresh.RefreshToken
 	}
 	expires := time.Now().UnixMilli() + refresh.ExpiresIn*1000
 	if refresh.ExpiresIn <= 0 {
 		expires = time.Now().UnixMilli() + 3600*1000
 	}
-	a.Expires = expires
 	a.ExpiresAt = expires
 }

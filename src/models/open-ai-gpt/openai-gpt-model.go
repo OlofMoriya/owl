@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	neturl "net/url"
 	"os"
 	commontypes "owl/common_types"
 	"owl/data"
 	"owl/logger"
 	"owl/models/open-ai-base"
+	"owl/openai_auth"
+	"strings"
 )
 
 type OpenAIGPTModel struct {
@@ -80,10 +83,20 @@ func (model *OpenAIGPTModel) HandleBodyBytes(bytes []byte) {
 }
 
 func createOpenAIGPTRequest(payload interface{}, isWebSearch bool) *http.Request {
-	apiKey, ok := os.LookupEnv("OPENAI_API_KEY")
-	if !ok {
-		panic(fmt.Errorf("OPENAI_API_KEY is required for chat-completions models"))
+	auth, err := openai_auth.Resolve()
+	if err != nil {
+		apiKey, ok := os.LookupEnv("OPENAI_API_KEY")
+		if !ok || strings.TrimSpace(apiKey) == "" {
+			panic(fmt.Errorf("could not resolve openai auth: %w", err))
+		}
+		logger.Debug.Printf("openai chat auth resolve failed, falling back to OPENAI_API_KEY: %v", err)
+		auth = openai_auth.ResolvedAuth{Token: apiKey, IsCodex: false}
 	}
+	authSource := "api_key"
+	if auth.IsCodex {
+		authSource = "oauth"
+	}
+	logger.Debug.Printf("openai chat auth source: %s", authSource)
 
 	jsonpayload, err := json.Marshal(payload)
 	if err != nil {
@@ -94,9 +107,23 @@ func createOpenAIGPTRequest(payload interface{}, isWebSearch bool) *http.Request
 
 	// Use different endpoint for web search
 	url := "https://api.openai.com/v1/chat/completions"
+	selectionReason := "standard_chat_completions"
 	if isWebSearch {
 		url = "https://api.openai.com/v1/responses"
+		selectionReason = "web_search_enabled"
 		logger.Debug.Println("Using OpenAI web search endpoint: /v1/responses")
+	}
+	parsedURL, parseErr := neturl.Parse(url)
+	if parseErr != nil {
+		logger.Debug.Printf("openai chat endpoint parse failed url=%s err=%v", url, parseErr)
+	} else {
+		logger.Debug.Printf(
+			"openai chat endpoint selected host=%s path=%s reason=%s auth_source=%s",
+			parsedURL.Host,
+			parsedURL.Path,
+			selectionReason,
+			authSource,
+		)
 	}
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonpayload))
@@ -105,7 +132,17 @@ func createOpenAIGPTRequest(payload interface{}, isWebSearch bool) *http.Request
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", auth.Token))
+	req.Header.Set("X-Owl-Auth-Source", authSource)
+	if auth.IsCodex && strings.TrimSpace(auth.AccountID) != "" {
+		req.Header.Set("ChatGPT-Account-Id", auth.AccountID)
+		req.Header.Set("ChatGPT-Account-ID", auth.AccountID)
+		req.Header.Set("OpenAI-Account-ID", auth.AccountID)
+		logger.Debug.Printf("openai chat account header present: true")
+	} else {
+		logger.Debug.Printf("openai chat account header present: false")
+	}
+	logger.Debug.Printf("openai chat request ready endpoint=%s auth_source=%s", url, authSource)
 
 	return req
 }

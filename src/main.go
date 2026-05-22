@@ -319,14 +319,13 @@ func handleAuthLogin() {
 		log.Fatalf("unsupported auth provider %q", provider)
 	}
 
-	fmt.Println("OpenAI device login required.")
+	fmt.Println("OpenAI browser login required.")
 	result, session, err := openai_auth.StartLogin()
 	if err != nil {
 		log.Fatalf("openai login failed: %v", err)
 	}
 	fmt.Printf("Visit: %s\n", result.VerificationURL)
-	fmt.Printf("Enter code: %s\n", result.UserCode)
-	fmt.Println("Waiting for authorization...")
+	fmt.Println("Waiting for browser callback...")
 
 	message, err := openai_auth.CompleteLogin(result, session)
 	if err != nil {

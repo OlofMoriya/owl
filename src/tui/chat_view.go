@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/atotto/clipboard"
@@ -398,6 +399,15 @@ func (m *chatViewModel) sendMessage(prompt string) tea.Cmd {
 		logger.Debug.Printf("MODEL SELECTION: %s (actual: %s)", modelName, actualModelName)
 
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errText := fmt.Sprintf("Error: %v", r)
+					logger.Debug.Printf("recovered panic from streamed query: %v", r)
+					handler.RecievedText("\n"+errText+"\n", nil)
+					handler.FinalText(m.shared.selectedCtx.Id, prompt, handler.fullResponse+"\n"+errText+"\n", nil, actualModelName, nil)
+				}
+			}()
+
 			selectedAgent := m.currentAgent()
 			contextForRequest := *m.shared.selectedCtx
 			skillsPrompt := loadSkillsPromptByNames(m.selectedSkills)
@@ -1592,7 +1602,10 @@ func displayModelName(model string) string {
 	case "gpt":
 		return "gpt (responses)"
 	case "codex":
-		return "codex (responses)"
+		if openai_auth.HasCodexOAuthCredential() {
+			return "codex (responses)"
+		}
+		return "codex (chat completions)"
 	case "gpt-chat":
 		return "gpt-chat (chat completions)"
 	case "codex-chat":
@@ -1890,11 +1903,21 @@ type tuiResponseHandler struct {
 	doneChan     chan struct{}
 	fullResponse string
 	Repository   data.HistoryRepository
+	doneOnce     sync.Once
 }
 
 func (h *tuiResponseHandler) RecievedText(text string, color *string) {
 	h.fullResponse += text
-	h.responseChan <- text
+	select {
+	case <-h.doneChan:
+		return
+	default:
+	}
+
+	select {
+	case h.responseChan <- text:
+	case <-h.doneChan:
+	}
 }
 
 func (h *tuiResponseHandler) FinalText(contextId int64, prompt string, response string, toolUse []data.ToolUse, modelName string, usage *commontypes.TokenUsage) {
@@ -1934,9 +1957,10 @@ func (h *tuiResponseHandler) FinalText(contextId int64, prompt string, response 
 
 	logger.Debug.Println("Final text in tui response channel")
 	if len(toolUse) == 0 {
-		logger.Debug.Println("closing doneChan and responseChan")
-		close(h.doneChan)
-		close(h.responseChan)
+		logger.Debug.Println("closing doneChan")
+		h.doneOnce.Do(func() {
+			close(h.doneChan)
+		})
 	} else {
 		logger.Debug.Println("not closing doneChan and responseChan because of expected response to tool call answers.")
 	}

@@ -34,11 +34,11 @@ func TestResolveUsesPersistedOAuth(t *testing.T) {
 		t.Fatalf("mkdir failed: %v", err)
 	}
 	file := oauthFile{
-		Type:      "oauth",
-		Access:    "oauth-access",
-		Refresh:   "oauth-refresh",
-		Expires:   time.Now().Add(10 * time.Minute).UnixMilli(),
-		AccountID: "acc-1",
+		Type:         "oauth",
+		AccessToken:  "oauth-access",
+		RefreshToken: "oauth-refresh",
+		ExpiresAt:    time.Now().Add(10 * time.Minute).UnixMilli(),
+		AccountID:    "acc-1",
 	}
 	encoded, _ := json.Marshal(file)
 	if err := os.WriteFile(path, encoded, 0o600); err != nil {
@@ -60,6 +60,64 @@ func TestResolveUsesPersistedOAuth(t *testing.T) {
 	}
 }
 
+func TestResolvePrefersOpenCodeAuthFile(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	opencodePath := filepath.Join(home, openCodeAuthFilePath)
+	if err := os.MkdirAll(filepath.Dir(opencodePath), 0o700); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+	opencodeContent := []byte(`{"openai":{"type":"oauth","access":"opencode-access","refresh":"opencode-refresh","expires":9999999999999,"accountId":"opencode-acc"}}`)
+	if err := os.WriteFile(opencodePath, opencodeContent, 0o600); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	owlPath := filepath.Join(home, openAIOAuthFilePath)
+	if err := os.MkdirAll(filepath.Dir(owlPath), 0o700); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+	owlContent := []byte(`{"type":"oauth","access_token":"owl-access","refresh_token":"owl-refresh","expires_at":9999999999999,"account_id":"owl-acc"}`)
+	if err := os.WriteFile(owlPath, owlContent, 0o600); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	auth, err := Resolve()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if auth.Token != "opencode-access" {
+		t.Fatalf("expected opencode token, got %q", auth.Token)
+	}
+	if auth.AccountID != "opencode-acc" {
+		t.Fatalf("expected opencode account id, got %q", auth.AccountID)
+	}
+}
+
+func TestResolveReadsCamelCaseAccountIdFromOwlAuthFile(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	path := filepath.Join(home, openAIOAuthFilePath)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+	content := []byte(`{"type":"oauth","access_token":"oauth-access","refresh_token":"oauth-refresh","expires_at":9999999999999,"accountId":"acc-camel"}`)
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	auth, err := Resolve()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if auth.AccountID != "acc-camel" {
+		t.Fatalf("expected camel account id, got %q", auth.AccountID)
+	}
+}
+
 func TestResolveRefreshesExpiredToken(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "")
 	home := t.TempDir()
@@ -70,11 +128,11 @@ func TestResolveRefreshesExpiredToken(t *testing.T) {
 		t.Fatalf("mkdir failed: %v", err)
 	}
 	file := oauthFile{
-		Type:      "oauth",
-		Access:    "old-access",
-		Refresh:   "oauth-refresh",
-		Expires:   time.Now().Add(-time.Minute).UnixMilli(),
-		AccountID: "acc-1",
+		Type:         "oauth",
+		AccessToken:  "old-access",
+		RefreshToken: "oauth-refresh",
+		ExpiresAt:    time.Now().Add(-time.Minute).UnixMilli(),
+		AccountID:    "acc-1",
 	}
 	encoded, _ := json.Marshal(file)
 	if err := os.WriteFile(path, encoded, 0o600); err != nil {
@@ -103,8 +161,8 @@ func TestResolveRefreshesExpiredToken(t *testing.T) {
 	if err := json.Unmarshal(updatedRaw, &updated); err != nil {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
-	if updated.accessToken() != "new-access" {
-		t.Fatalf("expected persisted refreshed token, got %q", updated.accessToken())
+	if updated.AccessToken != "new-access" {
+		t.Fatalf("expected persisted refreshed token, got %q", updated.AccessToken)
 	}
 }
 
@@ -118,7 +176,7 @@ func TestCurrentStatus(t *testing.T) {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		content := []byte(`{"type":"oauth","access":"token","refresh":"refresh","expires":9999999999999}`)
+		content := []byte(`{"type":"oauth","access_token":"token","refresh_token":"refresh","expires_at":9999999999999}`)
 		if err := os.WriteFile(path, content, 0o600); err != nil {
 			t.Fatalf("write failed: %v", err)
 		}

@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"image/png"
 	"net/http"
+	"net/url"
 	"os"
 	commontypes "owl/common_types"
 	"owl/data"
 	"owl/logger"
 	"owl/mode"
+	"owl/openai_auth"
 	"owl/services"
 	"owl/tools"
 	"strings"
@@ -58,9 +60,22 @@ func (model *OpenAiResponseModel) CreateRequest(context *data.Context, prompt st
 }
 
 func createRequest(payload RequestPayload) *http.Request {
-	apiKey, ok := os.LookupEnv("OPENAI_API_KEY")
-	if !ok {
-		panic(fmt.Errorf("Could not fetch api key"))
+	auth, err := openai_auth.Resolve()
+	if err != nil {
+		apiKey, ok := os.LookupEnv("OPENAI_API_KEY")
+		if !ok || strings.TrimSpace(apiKey) == "" {
+			panic(fmt.Errorf("could not resolve openai auth: %w", err))
+		}
+		logger.Debug.Printf("openai responses auth resolve failed, falling back to OPENAI_API_KEY: %v", err)
+		auth = openai_auth.ResolvedAuth{Token: apiKey, IsCodex: false}
+	}
+	authSource := "api_key"
+	if auth.IsCodex {
+		authSource = "oauth"
+	}
+	logger.Debug.Printf("openai responses auth source: %s", authSource)
+	if auth.IsCodex {
+		payload = adaptPayloadForCodex(payload)
 	}
 
 	jsonpayload, err := json.Marshal(payload)
@@ -70,21 +85,111 @@ func createRequest(payload RequestPayload) *http.Request {
 		panic("failed to marshal payload")
 	}
 
-	url := "https://api.openai.com/v1/responses"
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonpayload))
+	requestURL, selectionReason := resolveResponsesEndpoint(auth)
+	parsedURL, parseErr := url.Parse(requestURL)
+	if parseErr != nil {
+		logger.Debug.Printf("openai responses endpoint parse failed url=%s err=%v", requestURL, parseErr)
+	} else {
+		logger.Debug.Printf(
+			"openai responses endpoint selected host=%s path=%s reason=%s auth_source=%s",
+			parsedURL.Host,
+			parsedURL.Path,
+			selectionReason,
+			authSource,
+		)
+	}
+
+	req, err := http.NewRequest("POST", requestURL, bytes.NewBuffer(jsonpayload))
 	if err != nil {
 		panic(fmt.Errorf("failed to create request: %v", err))
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", auth.Token))
+	req.Header.Set("X-Owl-Auth-Source", authSource)
+	if auth.IsCodex && strings.TrimSpace(auth.AccountID) != "" {
+		req.Header.Set("ChatGPT-Account-Id", auth.AccountID)
+		req.Header.Set("ChatGPT-Account-ID", auth.AccountID)
+		req.Header.Set("OpenAI-Account-ID", auth.AccountID)
+		logger.Debug.Printf("openai responses account header present: true")
+	} else {
+		logger.Debug.Printf("openai responses account header present: false")
+	}
+
+	logger.Debug.Printf("openai responses request ready model=%s endpoint=%s auth_source=%s", payload.Model, requestURL, authSource)
 
 	return req
 }
 
+func adaptPayloadForCodex(payload RequestPayload) RequestPayload {
+	store := false
+	payload.Store = &store
+	if payload.Stream == nil {
+		stream := true
+		payload.Stream = &stream
+	}
+
+	inputItems, ok := payload.Input.([]interface{})
+	if !ok {
+		if payload.Instructions == nil || strings.TrimSpace(*payload.Instructions) == "" {
+			defaultInstructions := "You are a helpful assistant."
+			payload.Instructions = &defaultInstructions
+			logger.Debug.Printf("openai responses codex payload adjustment: input_not_array set_default_instructions=true store=false stream=%t", payload.Stream != nil && *payload.Stream)
+		}
+		return payload
+	}
+
+	systemParts := []string{}
+	filtered := make([]interface{}, 0, len(inputItems))
+	for _, item := range inputItems {
+		msg, ok := item.(InputMessage)
+		if ok && strings.EqualFold(msg.Role, "system") {
+			trimmed := strings.TrimSpace(msg.Content)
+			if trimmed != "" {
+				systemParts = append(systemParts, trimmed)
+			}
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+
+	payload.Input = filtered
+	if payload.Instructions == nil || strings.TrimSpace(*payload.Instructions) == "" {
+		instructions := strings.TrimSpace(strings.Join(systemParts, "\n\n"))
+		if instructions == "" {
+			instructions = "You are a helpful assistant."
+		}
+		payload.Instructions = &instructions
+	}
+
+	logger.Debug.Printf(
+		"openai responses codex payload adjustment: removed_system_messages=%d instructions_present=%t input_items_after=%d store=false stream=%t",
+		len(inputItems)-len(filtered),
+		payload.Instructions != nil && strings.TrimSpace(*payload.Instructions) != "",
+		len(filtered),
+		payload.Stream != nil && *payload.Stream,
+	)
+	return payload
+}
+
+func resolveResponsesEndpoint(auth openai_auth.ResolvedAuth) (string, string) {
+	codexURL := strings.TrimSpace(os.Getenv("OWL_OPENAI_CODEX_RESPONSES_URL"))
+	if codexURL == "" {
+		codexURL = "https://chatgpt.com/backend-api/codex/responses"
+	}
+	if auth.IsCodex {
+		return codexURL, "codex_oauth"
+	}
+	return "https://api.openai.com/v1/responses", "api_key_or_non_codex"
+}
+
 func createResponsePayload(context *data.Context, prompt string, streaming bool, history []data.History, modifiers *commontypes.PayloadModifiers, requestedModel string) RequestPayload {
 	modelVersion := "gpt-5.3-chat-latest"
-	if requestedModel == "gpt-5.5" {
+	if requestedModel == "codex" {
+		modelVersion = "gpt-5.3-codex"
+	} else if requestedModel == "gpt" {
+		modelVersion = "gpt-5.3-chat-latest"
+	} else if requestedModel == "gpt-5.5" {
 		modelVersion = "gpt-5.5"
 	} else if requestedModel == "gpt-5.4" {
 		modelVersion = "gpt-5.4"
@@ -94,8 +199,10 @@ func createResponsePayload(context *data.Context, prompt string, streaming bool,
 		modifiers = &commontypes.PayloadModifiers{}
 	}
 
+	disableTools := strings.EqualFold(strings.TrimSpace(os.Getenv("OWL_OPENAI_RESPONSES_DISABLE_TOOLS")), "true")
+
 	toolList := []Tool{}
-	if modifiers != nil {
+	if !disableTools && modifiers != nil {
 		if modifiers.Image {
 			toolList = append(toolList, Tool{Type: "image_generation"})
 		}
@@ -105,21 +212,25 @@ func createResponsePayload(context *data.Context, prompt string, streaming bool,
 		}
 	}
 
-	customTools := tools.GetCustomTools(mode.Mode, modifiers.ToolGroupFilters...)
-	for _, customTool := range customTools {
-		params := map[string]interface{}{
-			"type":       customTool.InputSchema.Type,
-			"properties": convertProperties(customTool.InputSchema.Properties),
+	if !disableTools {
+		customTools := tools.GetCustomTools(mode.Mode, modifiers.ToolGroupFilters...)
+		for _, customTool := range customTools {
+			params := map[string]interface{}{
+				"type":       customTool.InputSchema.Type,
+				"properties": convertProperties(customTool.InputSchema.Properties),
+			}
+			if len(customTool.InputSchema.Required) > 0 {
+				params["required"] = customTool.InputSchema.Required
+			}
+			toolList = append(toolList, Tool{
+				Type:        "function",
+				Name:        customTool.Name,
+				Description: customTool.Description,
+				Parameters:  params,
+			})
 		}
-		if len(customTool.InputSchema.Required) > 0 {
-			params["required"] = customTool.InputSchema.Required
-		}
-		toolList = append(toolList, Tool{
-			Type:        "function",
-			Name:        customTool.Name,
-			Description: customTool.Description,
-			Parameters:  params,
-		})
+	} else {
+		logger.Debug.Println("openai responses tools disabled via OWL_OPENAI_RESPONSES_DISABLE_TOOLS=true")
 	}
 
 	input := buildInput(context, prompt, history, modifiers)
@@ -165,8 +276,8 @@ func buildInput(context *data.Context, prompt string, history []data.History, mo
 	if context != nil {
 		systemPrompt := strings.TrimSpace(context.SystemPrompt)
 		if systemPrompt != "" {
-			items = append(items, InputMessage{Type: "message", Role: "developer", Content: systemPrompt})
-			logger.Debug.Printf("DEVELOPER: %s", getFirstNWords(systemPrompt, 5))
+			items = append(items, InputMessage{Role: "system", Content: systemPrompt})
+			logger.Debug.Printf("SYSTEM: %s", getFirstNWords(systemPrompt, 5))
 		}
 	}
 
@@ -179,7 +290,7 @@ func buildInput(context *data.Context, prompt string, history []data.History, mo
 
 		// Add user prompt
 		if p := strings.TrimSpace(h.Prompt); p != "" {
-			items = append(items, InputMessage{Type: "message", Role: "user", Content: p})
+			items = append(items, InputMessage{Role: "user", Content: p})
 			logger.Debug.Printf("USER: %s", getFirstNWords(p, 5))
 		}
 
@@ -218,13 +329,13 @@ func buildInput(context *data.Context, prompt string, history []data.History, mo
 
 			// Add assistant's final response if any (after processing tools)
 			if r := strings.TrimSpace(h.Response); r != "" {
-				items = append(items, InputMessage{Type: "message", Role: "assistant", Content: r})
+				items = append(items, InputMessage{Role: "assistant", Content: r})
 				logger.Debug.Printf("ASSISTANT: %s", getFirstNWords(r, 5))
 			}
 		} else {
 			// No tool uses - just add the assistant response as text
 			if r := strings.TrimSpace(h.Response); r != "" {
-				items = append(items, InputMessage{Type: "message", Role: "assistant", Content: r})
+				items = append(items, InputMessage{Role: "assistant", Content: r})
 				logger.Debug.Printf("ASSISTANT: %s", getFirstNWords(r, 5))
 			}
 		}
@@ -274,19 +385,13 @@ func buildInput(context *data.Context, prompt string, history []data.History, mo
 
 	// Add current prompt if provided
 	if p := strings.TrimSpace(prompt); p != "" {
-		items = append(items, InputMessage{Type: "message", Role: "user", Content: p})
+		items = append(items, InputMessage{Role: "user", Content: p})
 		logger.Debug.Printf("USER (current): %s", getFirstNWords(p, 5))
 	}
 
 	logger.Debug.Printf("========================================")
 	logger.Debug.Printf("Total items in payload: %d", len(items))
 	logger.Debug.Println("========================================")
-
-	if len(items) == 1 {
-		if single, ok := items[0].(InputMessage); ok && single.Role == "user" {
-			return single.Content
-		}
-	}
 
 	return items
 }
@@ -441,11 +546,52 @@ func (model *OpenAiResponseModel) HandleStreamedLine(line []byte) {
 			}
 			model.ResponseHandler.FinalText(model.contextId, model.prompt, model.accumulatedAnswer, nil, model.modelName, nil)
 
+		case "error", "response.failed":
+			msg := extractStreamErrorMessage(event)
+			if strings.TrimSpace(msg) == "" {
+				msg = "Request failed during streaming"
+			}
+			logger.Debug.Printf("streamed: failure event (%s): %s", eventType, msg)
+			model.ResponseHandler.RecievedText("\nError: "+msg+"\n", nil)
+			model.ResponseHandler.FinalText(model.contextId, model.prompt, model.accumulatedAnswer, nil, model.modelName, nil)
+
 		default:
 			// Ignore unknown event types to remain resilient.
 			logger.Debug.Printf("streamed: ignoring event type: %s", eventType)
 		}
 	}
+}
+
+func extractStreamErrorMessage(event map[string]interface{}) string {
+	if errObj, ok := event["error"].(map[string]interface{}); ok {
+		code, _ := errObj["code"].(string)
+		msg, _ := errObj["message"].(string)
+		if strings.TrimSpace(code) != "" && strings.TrimSpace(msg) != "" {
+			return fmt.Sprintf("%s: %s", code, msg)
+		}
+		if strings.TrimSpace(msg) != "" {
+			return msg
+		}
+	}
+
+	if responseObj, ok := event["response"].(map[string]interface{}); ok {
+		if errObj, ok := responseObj["error"].(map[string]interface{}); ok {
+			code, _ := errObj["code"].(string)
+			msg, _ := errObj["message"].(string)
+			if strings.TrimSpace(code) != "" && strings.TrimSpace(msg) != "" {
+				return fmt.Sprintf("%s: %s", code, msg)
+			}
+			if strings.TrimSpace(msg) != "" {
+				return msg
+			}
+		}
+	}
+
+	if msg, ok := event["message"].(string); ok {
+		return msg
+	}
+
+	return ""
 }
 
 // executeStreamedFunctionCalls runs all accumulated function calls from streaming

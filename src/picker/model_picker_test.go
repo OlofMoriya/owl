@@ -35,7 +35,7 @@ func TestGetModelForQuery_DefaultsToCodexWithCodexAuth(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatalf("mkdir failed: %v", err)
 	}
-	content := []byte(`{"type":"oauth","access":"token","refresh":"refresh","expires":9999999999999}`)
+	content := []byte(`{"type":"oauth","access_token":"token","refresh_token":"refresh","expires_at":9999999999999}`)
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatalf("write failed: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestGetModelForQuery_GptUsesResponsesWithCodexAuth(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatalf("mkdir failed: %v", err)
 	}
-	content := []byte(`{"type":"oauth","access":"token","refresh":"refresh","expires":9999999999999}`)
+	content := []byte(`{"type":"oauth","access_token":"token","refresh_token":"refresh","expires_at":9999999999999}`)
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatalf("write failed: %v", err)
 	}
