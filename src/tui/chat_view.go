@@ -84,6 +84,31 @@ func backgroundPrefix(bg termenv.Color) string {
 
 type chatMode int
 
+type turnType int
+
+const (
+	turnTypeUser turnType = iota
+	turnTypeInternal
+)
+
+type turnState int
+
+const (
+	turnStateActive turnState = iota
+	turnStateCompleted
+	turnStateFailed
+	turnStateCanceled
+)
+
+type chatTurn struct {
+	id           string
+	turnType     turnType
+	state        turnState
+	prompt       string
+	responseChan chan string
+	doneChan     chan struct{}
+}
+
 const (
 	chatInputMode chatMode = iota
 	chatNormalMode
@@ -149,6 +174,8 @@ type chatViewModel struct {
 	fileDisplay      *fileDisplayState
 	selectedPDF      string
 	selectedSkills   []string
+	activeTurns      map[string]*chatTurn
+	turnCounter      int64
 }
 
 const (
@@ -173,6 +200,7 @@ type clearStatusMsg struct {
 type historyPersistedMsg int64
 
 type chatChunkMsg struct {
+	turnID       string
 	text         string
 	responseChan chan string
 	doneChan     chan struct{}
@@ -180,11 +208,13 @@ type chatChunkMsg struct {
 }
 
 type chatCompleteMsg struct {
+	turnID   string
 	prompt   string
 	response string
 }
 
 type chatErrorMsg struct {
+	turnID string
 	err error
 }
 
@@ -276,6 +306,7 @@ func newChatViewModel(shared *sharedState) *chatViewModel {
 		statusMessage:    "",
 		showUsagePanel:   shared.width >= usagePanelMinWidth,
 		selectedSkills:   selectedSkills,
+		activeTurns:      map[string]*chatTurn{},
 	}
 	m.applyLayout()
 	return m
@@ -373,6 +404,15 @@ func (m *chatViewModel) sendMessage(prompt string) tea.Cmd {
 	return func() tea.Msg {
 		responseChan := make(chan string, 100)
 		doneChan := make(chan struct{})
+		turnID := m.nextTurnID(turnTypeUser)
+		m.registerTurn(&chatTurn{
+			id:           turnID,
+			turnType:     turnTypeUser,
+			state:        turnStateActive,
+			prompt:       prompt,
+			responseChan: responseChan,
+			doneChan:     doneChan,
+		})
 
 		handler := &tuiResponseHandler{
 			responseChan: responseChan,
@@ -432,12 +472,12 @@ func (m *chatViewModel) sendMessage(prompt string) tea.Cmd {
 			)
 		}()
 
-		waitCmd := waitForChatActivity(responseChan, doneChan, prompt)
+		waitCmd := waitForChatActivity(turnID, responseChan, doneChan, prompt)
 		return waitCmd()
 	}
 }
 
-func waitForChatActivity(responseChan chan string, doneChan chan struct{},
+func waitForChatActivity(turnID string, responseChan chan string, doneChan chan struct{},
 	prompt string) tea.Cmd {
 
 	logger.Debug.Println("waitForChatActivity started")
@@ -447,9 +487,10 @@ func waitForChatActivity(responseChan chan string, doneChan chan struct{},
 		case text, ok := <-responseChan:
 			// logger.Debug.Printf("responseChan: %v: %s", ok, text)
 			if !ok {
-				return chatCompleteMsg{prompt: prompt}
+				return chatCompleteMsg{turnID: turnID, prompt: prompt}
 			}
 			return chatChunkMsg{
+				turnID:       turnID,
 				text:         text,
 				responseChan: responseChan,
 				doneChan:     doneChan,
@@ -457,9 +498,56 @@ func waitForChatActivity(responseChan chan string, doneChan chan struct{},
 			}
 		case <-doneChan:
 			logger.Debug.Printf("doneChan from waitForChatActivity")
-			return chatCompleteMsg{prompt: prompt}
+			return chatCompleteMsg{turnID: turnID, prompt: prompt}
 		}
 	}
+}
+
+func (m *chatViewModel) nextTurnID(tt turnType) string {
+	m.turnCounter++
+	prefix := "user"
+	if tt == turnTypeInternal {
+		prefix = "internal"
+	}
+	return fmt.Sprintf("%s-%d", prefix, m.turnCounter)
+}
+
+func (m *chatViewModel) registerTurn(turn *chatTurn) {
+	if turn == nil {
+		return
+	}
+	if m.activeTurns == nil {
+		m.activeTurns = map[string]*chatTurn{}
+	}
+	m.activeTurns[turn.id] = turn
+}
+
+func (m *chatViewModel) getTurn(turnID string) (*chatTurn, bool) {
+	if m.activeTurns == nil {
+		return nil, false
+	}
+	turn, ok := m.activeTurns[turnID]
+	return turn, ok
+}
+
+func (m *chatViewModel) completeTurn(turnID string, state turnState) {
+	if m.activeTurns == nil {
+		return
+	}
+	turn, ok := m.activeTurns[turnID]
+	if !ok {
+		return
+	}
+	turn.state = state
+}
+
+func (m *chatViewModel) hasActiveUserTurn() bool {
+	for _, turn := range m.activeTurns {
+		if turn != nil && turn.turnType == turnTypeUser && turn.state == turnStateActive {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *chatViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -509,11 +597,18 @@ func (m *chatViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.listenForHistoryPersisted()
 
 	case chatChunkMsg:
+		if _, ok := m.getTurn(msg.turnID); !ok {
+			return m, nil
+		}
 		m.currentResponse += msg.text
 		m.updateViewportContent()
-		return m, waitForChatActivity(msg.responseChan, msg.doneChan, msg.prompt)
+		return m, waitForChatActivity(msg.turnID, msg.responseChan, msg.doneChan, msg.prompt)
 
 	case chatCompleteMsg:
+		if _, ok := m.getTurn(msg.turnID); !ok {
+			return m, nil
+		}
+		m.completeTurn(msg.turnID, turnStateCompleted)
 		logger.Debug.Println("got chatCompleteMsg")
 		m.sending = false
 		m.loading = false
@@ -521,6 +616,9 @@ func (m *chatViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.loadHistory()
 
 	case chatErrorMsg:
+		if _, ok := m.getTurn(msg.turnID); ok {
+			m.completeTurn(msg.turnID, turnStateFailed)
+		}
 		m.err = msg.err
 		m.loading = false
 		m.sending = false

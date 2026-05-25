@@ -467,24 +467,13 @@ func (model *OpenAiResponseModel) HandleStreamedLine(line []byte) {
 			}
 
 		case "response.output_item.added":
-			// A new output item is starting — check if it's a function call
 			if item, ok := event["item"].(map[string]interface{}); ok {
-				itemType, _ := item["type"].(string)
-				logger.Debug.Printf("streamed output_item.added type: %s", itemType)
-				if itemType == "function_call" {
-					fc := &StreamedFunctionCall{}
-					if id, ok := item["id"].(string); ok {
-						fc.ID = id
-					}
-					if callID, ok := item["call_id"].(string); ok {
-						fc.CallID = callID
-					}
-					if name, ok := item["name"].(string); ok {
-						fc.Name = name
-					}
-					model.currentFunctionCall = fc
-					logger.Debug.Printf("streaming function call started: %s (call_id: %s)", fc.Name, fc.CallID)
-				}
+				model.handleStreamedOutputItem(item, false)
+			}
+
+		case "response.output_item.done":
+			if item, ok := event["item"].(map[string]interface{}); ok {
+				model.handleStreamedOutputItem(item, true)
 			}
 
 		case "response.function_call_arguments.delta":
@@ -500,7 +489,7 @@ func (model *OpenAiResponseModel) HandleStreamedLine(line []byte) {
 				if args, ok := event["arguments"].(string); ok {
 					model.currentFunctionCall.Arguments = args
 				}
-				model.streamedFunctionCalls = append(model.streamedFunctionCalls, *model.currentFunctionCall)
+				model.appendStreamedFunctionCall(*model.currentFunctionCall)
 				logger.Debug.Printf("streaming function call done: %s args=%s", model.currentFunctionCall.Name, model.currentFunctionCall.Arguments)
 				model.currentFunctionCall = nil
 			}
@@ -521,6 +510,9 @@ func (model *OpenAiResponseModel) HandleStreamedLine(line []byte) {
 			// Execute any accumulated function calls and do follow-up
 			localToolUses := model.executeStreamedFunctionCalls()
 			logger.Debug.Printf("streamed: executed %d function calls", len(localToolUses))
+			if len(localToolUses) == 0 {
+				logger.Debug.Printf("streamed: completed without tool calls; this can happen when the model chooses not to call tools")
+			}
 
 			model.ResponseHandler.FinalText(model.contextId, model.prompt, model.accumulatedAnswer, localToolUses, model.modelName, nil)
 			logger.Debug.Printf("streamed: FinalText sent")
@@ -560,6 +552,76 @@ func (model *OpenAiResponseModel) HandleStreamedLine(line []byte) {
 			logger.Debug.Printf("streamed: ignoring event type: %s", eventType)
 		}
 	}
+}
+
+func (model *OpenAiResponseModel) handleStreamedOutputItem(item map[string]interface{}, isDone bool) {
+	itemType, _ := item["type"].(string)
+	phase := "added"
+	if isDone {
+		phase = "done"
+	}
+	logger.Debug.Printf("streamed output_item.%s type: %s", phase, itemType)
+	if itemType != "function_call" {
+		return
+	}
+
+	fc := &StreamedFunctionCall{}
+	if id, ok := item["id"].(string); ok {
+		fc.ID = id
+	}
+	if callID, ok := item["call_id"].(string); ok {
+		fc.CallID = callID
+	}
+	if name, ok := item["name"].(string); ok {
+		fc.Name = name
+	}
+	if args, ok := item["arguments"].(string); ok {
+		fc.Arguments = args
+	}
+
+	if !isDone {
+		model.currentFunctionCall = fc
+		logger.Debug.Printf("streaming function call started: %s (call_id: %s)", fc.Name, fc.CallID)
+		return
+	}
+
+	if model.currentFunctionCall != nil {
+		if fc.ID == "" {
+			fc.ID = model.currentFunctionCall.ID
+		}
+		if fc.CallID == "" {
+			fc.CallID = model.currentFunctionCall.CallID
+		}
+		if fc.Name == "" {
+			fc.Name = model.currentFunctionCall.Name
+		}
+		if strings.TrimSpace(fc.Arguments) == "" {
+			fc.Arguments = model.currentFunctionCall.Arguments
+		}
+	}
+
+	if strings.TrimSpace(fc.CallID) == "" {
+		logger.Debug.Printf("streaming function call done missing call_id; skipping append")
+		model.currentFunctionCall = nil
+		return
+	}
+
+	if strings.TrimSpace(fc.Arguments) == "" {
+		fc.Arguments = "{}"
+	}
+
+	model.appendStreamedFunctionCall(*fc)
+	logger.Debug.Printf("streaming function call done from output_item: %s args=%s", fc.Name, fc.Arguments)
+	model.currentFunctionCall = nil
+}
+
+func (model *OpenAiResponseModel) appendStreamedFunctionCall(fc StreamedFunctionCall) {
+	for _, existing := range model.streamedFunctionCalls {
+		if existing.CallID != "" && existing.CallID == fc.CallID {
+			return
+		}
+	}
+	model.streamedFunctionCalls = append(model.streamedFunctionCalls, fc)
 }
 
 func extractStreamErrorMessage(event map[string]interface{}) string {
