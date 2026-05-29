@@ -239,6 +239,14 @@ func createResponsePayload(context *data.Context, prompt string, streaming bool,
 		Model: modelVersion,
 		Input: input,
 	}
+
+	effort, usedFallback := resolveReasoningEffort()
+	request.Reasoning = &Reasoning{Effort: &effort}
+	if usedFallback {
+		logger.Debug.Printf("openai responses reasoning effort fallback applied requested=auto effective=%s", effort)
+	}
+	logger.Debug.Printf("openai responses request tuning model=%s reasoning_effort=%s", modelVersion, effort)
+
 	if len(toolList) > 0 {
 		request.Tools = toolList
 	}
@@ -250,6 +258,33 @@ func createResponsePayload(context *data.Context, prompt string, streaming bool,
 	logger.Debug.Println("Will send payload")
 	logger.Debug.Printf("request %v", request)
 	return request
+}
+
+func resolveReasoningEffort() (string, bool) {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("OWL_OPENAI_REASONING_EFFORT")))
+	if raw == "" {
+		raw = "auto"
+	}
+
+	valid := map[string]bool{
+		"none":    true,
+		"minimal": true,
+		"low":     true,
+		"medium":  true,
+		"high":    true,
+		"xhigh":   true,
+		"auto":    true,
+	}
+	if !valid[raw] {
+		logger.Debug.Printf("openai responses reasoning effort invalid=%q fallback=medium", raw)
+		return "medium", true
+	}
+
+	if raw == "auto" {
+		return "medium", true
+	}
+
+	return raw, false
 }
 
 // getFirstNWords returns the first N words from a string

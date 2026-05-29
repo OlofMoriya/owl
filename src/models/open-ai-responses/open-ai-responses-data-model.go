@@ -9,6 +9,8 @@ type RequestPayload struct {
 	Model        string      `json:"model"`
 	Input        interface{} `json:"input"`
 	Instructions *string     `json:"instructions,omitempty"`
+	Reasoning    *Reasoning  `json:"reasoning,omitempty"`
+	Temperature  *float64    `json:"temperature,omitempty"`
 	Store        *bool       `json:"store,omitempty"`
 	Tools        []Tool      `json:"tools,omitempty"`
 	Stream       *bool       `json:"stream,omitempty"`

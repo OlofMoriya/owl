@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"owl/agents"
@@ -18,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	spinner "gabe565.com/spinners"
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -105,6 +107,8 @@ type chatTurn struct {
 	turnType     turnType
 	state        turnState
 	prompt       string
+	ctx          context.Context
+	cancel       context.CancelFunc
 	responseChan chan string
 	doneChan     chan struct{}
 }
@@ -145,7 +149,6 @@ type chatViewModel struct {
 	viewport        viewport.Model
 	loading         bool
 	ready           bool
-	sending         bool
 	width           int
 	height          int
 	err             error
@@ -176,6 +179,9 @@ type chatViewModel struct {
 	selectedSkills   []string
 	activeTurns      map[string]*chatTurn
 	turnCounter      int64
+	spinnerFrames    []string
+	spinnerInterval  time.Duration
+	spinnerFrame     int
 }
 
 const (
@@ -197,6 +203,8 @@ type clearStatusMsg struct {
 	version int
 }
 
+type spinnerTickMsg struct{}
+
 type historyPersistedMsg int64
 
 type chatChunkMsg struct {
@@ -215,7 +223,7 @@ type chatCompleteMsg struct {
 
 type chatErrorMsg struct {
 	turnID string
-	err error
+	err    error
 }
 
 type questionPromptMsg struct {
@@ -307,6 +315,8 @@ func newChatViewModel(shared *sharedState) *chatViewModel {
 		showUsagePanel:   shared.width >= usagePanelMinWidth,
 		selectedSkills:   selectedSkills,
 		activeTurns:      map[string]*chatTurn{},
+		spinnerFrames:    spinner.Dots.Frames,
+		spinnerInterval:  spinner.Dots.Interval,
 	}
 	m.applyLayout()
 	return m
@@ -338,6 +348,16 @@ func (m *chatViewModel) listenForStatus() tea.Cmd {
 
 		return statusMsg(msg)
 	}
+}
+
+func (m *chatViewModel) spinnerTickCmd() tea.Cmd {
+	interval := m.spinnerInterval
+	if interval <= 0 {
+		interval = 100 * time.Millisecond
+	}
+	return tea.Tick(interval, func(time.Time) tea.Msg {
+		return spinnerTickMsg{}
+	})
 }
 
 func (m *chatViewModel) listenForHistoryPersisted() tea.Cmd {
@@ -404,12 +424,15 @@ func (m *chatViewModel) sendMessage(prompt string) tea.Cmd {
 	return func() tea.Msg {
 		responseChan := make(chan string, 100)
 		doneChan := make(chan struct{})
+		ctx, cancel := context.WithCancel(context.Background())
 		turnID := m.nextTurnID(turnTypeUser)
 		m.registerTurn(&chatTurn{
 			id:           turnID,
 			turnType:     turnTypeUser,
 			state:        turnStateActive,
 			prompt:       prompt,
+			ctx:          ctx,
+			cancel:       cancel,
 			responseChan: responseChan,
 			doneChan:     doneChan,
 		})
@@ -447,6 +470,12 @@ func (m *chatViewModel) sendMessage(prompt string) tea.Cmd {
 					handler.FinalText(m.shared.selectedCtx.Id, prompt, handler.fullResponse+"\n"+errText+"\n", nil, actualModelName, nil)
 				}
 			}()
+
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 
 			selectedAgent := m.currentAgent()
 			contextForRequest := *m.shared.selectedCtx
@@ -538,7 +567,22 @@ func (m *chatViewModel) completeTurn(turnID string, state turnState) {
 	if !ok {
 		return
 	}
+	if turn.cancel != nil && turn.state == turnStateActive {
+		turn.cancel()
+		turn.cancel = nil
+	}
 	turn.state = state
+}
+
+func (m *chatViewModel) cancelActiveUserTurns() {
+	if m.activeTurns == nil {
+		return
+	}
+	for id, turn := range m.activeTurns {
+		if turn != nil && turn.turnType == turnTypeUser && turn.state == turnStateActive {
+			m.completeTurn(id, turnStateCanceled)
+		}
+	}
 }
 
 func (m *chatViewModel) hasActiveUserTurn() bool {
@@ -586,6 +630,16 @@ func (m *chatViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case spinnerTickMsg:
+		if !m.hasActiveUserTurn() {
+			m.spinnerFrame = 0
+			return m, nil
+		}
+		if len(m.spinnerFrames) > 0 {
+			m.spinnerFrame = (m.spinnerFrame + 1) % len(m.spinnerFrames)
+		}
+		return m, m.spinnerTickCmd()
+
 	case historyPersistedMsg:
 		if int64(msg) == m.shared.selectedCtx.Id {
 			m.currentResponse = ""
@@ -610,7 +664,6 @@ func (m *chatViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.completeTurn(msg.turnID, turnStateCompleted)
 		logger.Debug.Println("got chatCompleteMsg")
-		m.sending = false
 		m.loading = false
 		m.statusMessage = ""
 		return m, m.loadHistory()
@@ -621,12 +674,10 @@ func (m *chatViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = msg.err
 		m.loading = false
-		m.sending = false
 		m.statusMessage = ""
 		return m, nil
 
 	case authCommandResultMsg:
-		m.sending = false
 		if msg.err != nil {
 			m.statusMessage = msg.err.Error()
 		} else {
@@ -655,12 +706,14 @@ func (m *chatViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.handleFileDisplayModeKey(msg)
 		}
 
-		if m.sending {
-			return m, nil
-		}
-
 		if m.mode == chatNormalMode {
 			switch msg.String() {
+			case "ctrl+x":
+				m.cancelActiveUserTurns()
+				m.statusMessage = "Canceled active turn"
+				m.statusVersion++
+				return m, m.clearStatusAfterDelay(m.statusVersion)
+
 			case "i":
 				m.mode = chatInputMode
 				m.textarea.Focus()
@@ -792,6 +845,12 @@ func (m *chatViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.String() {
+		case "ctrl+x":
+			m.cancelActiveUserTurns()
+			m.statusMessage = "Canceled active turn"
+			m.statusVersion++
+			return m, m.clearStatusAfterDelay(m.statusVersion)
+
 		case "tab":
 			m.selectNextAgent()
 			m.persistAgentPreference()
@@ -852,18 +911,22 @@ func (m *chatViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "ctrl+w":
-			if !m.sending && m.textarea.Value() != "" {
+			if !m.hasActiveUserTurn() && m.textarea.Value() != "" {
 				prompt := m.textarea.Value()
 				if strings.HasPrefix(strings.TrimSpace(prompt), "/") {
-					m.sending = true
 					m.textarea.Reset()
 					return m, m.handleSlashCommand(prompt)
 				}
-				m.sending = true
 				m.currentPrompt = prompt
 				m.currentResponse = ""
+				m.spinnerFrame = 0
 				m.textarea.Reset()
-				return m, m.sendMessage(prompt)
+				return m, tea.Batch(m.sendMessage(prompt), m.spinnerTickCmd())
+			}
+			if m.hasActiveUserTurn() {
+				m.statusMessage = "Wait for active turn to complete"
+				m.statusVersion++
+				return m, m.clearStatusAfterDelay(m.statusVersion)
 			}
 
 		case "ctrl+u":
@@ -896,13 +959,11 @@ func (m *chatViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateViewportContent()
 
 	case messageDoneMsg:
-		m.sending = false
 		return m, m.loadHistory()
 
 	case errorMsg:
 		m.err = msg.err
 		m.loading = false
-		m.sending = false
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -1336,13 +1397,14 @@ func (m *chatViewModel) View() string {
 		return m.renderFileDisplayPrompt()
 	}
 
-	status := ""
-	if m.sending {
-		status = sendingStyle.Render(" Sending...")
+	spinnerStatus := ""
+	if m.hasActiveUserTurn() && len(m.spinnerFrames) > 0 {
+		spinnerStatus = sendingStyle.Render(m.spinnerFrames[m.spinnerFrame] + " ")
 	}
 
+	status := ""
 	if m.statusMessage != "" {
-		status = dimStyle.Render(fmt.Sprintf("%s %s", status, m.statusMessage))
+		status = dimStyle.Render(m.statusMessage)
 	}
 
 	modeLabel := "Mode: INPUT"
@@ -1371,7 +1433,7 @@ func (m *chatViewModel) View() string {
 	}
 
 	agent := m.currentAgent()
-	agentLabel := fmt.Sprintf("Agent: %s", agent.DisplayName)
+	agentLabel := fmt.Sprintf("%sAgent: %s", spinnerStatus, agent.DisplayName)
 	agentLabelStyle := dimStyle.Foreground(agentAccentColor(agent.AccentColor))
 	textareaStyled := textareaAgentStyle(agent.AccentColor).Render(m.textarea.View())
 
@@ -1609,7 +1671,7 @@ func (m *chatViewModel) updateViewportContent() {
 		}
 	}
 
-	if m.sending && m.currentResponse != "" {
+	if m.hasActiveUserTurn() && m.currentResponse != "" {
 		b.WriteString(userPromptStyle.Copy().Width(contentWidth).Render(fmt.Sprintf("You: %s", m.currentPrompt)))
 		b.WriteString("\n\n")
 
