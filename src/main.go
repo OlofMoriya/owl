@@ -412,6 +412,8 @@ func launchTUI() {
 	cliResponseHandler := CliResponseHandler{Repository: user}
 	model := &claude_model.ClaudeModel{ResponseHandler: cliResponseHandler, HistoryRepository: user, UseThinking: true, StreamThought: false, OutputThought: false}
 
+	tui.SetAssistantResponseBackgroundColor(nil)
+
 	config := tui.TUIConfig{Repository: user, Model: model, HistoryCount: services.DefaultHistoryCount}
 
 	if err := tui.Run(config); err != nil {

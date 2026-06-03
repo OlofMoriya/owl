@@ -34,8 +34,11 @@ import (
 
 func renderWithBackground(rendered string, width int, bg termenv.Color) string {
 	lines := strings.Split(rendered, "\n")
-	bgPrefix := backgroundPrefix(bg)
 	reset := "\x1b[0m"
+	bgPrefix := ""
+	if bg != nil {
+		bgPrefix = backgroundPrefix(bg)
+	}
 
 	for i, line := range lines {
 		// Tabs in markdown/code blocks render wider than rune counts,
@@ -50,6 +53,11 @@ func renderWithBackground(rendered string, width int, bg termenv.Color) string {
 
 		if lineWidth < width {
 			line += strings.Repeat(" ", width-lineWidth)
+		}
+
+		if bgPrefix == "" {
+			lines[i] = line
+			continue
 		}
 
 		withBg := bgPrefix + line
@@ -103,15 +111,23 @@ const (
 )
 
 type chatTurn struct {
-	id           string
-	turnType     turnType
-	state        turnState
-	prompt       string
-	ctx          context.Context
-	cancel       context.CancelFunc
-	responseChan chan string
-	doneChan     chan struct{}
+	id                        string
+	turnType                  turnType
+	state                     turnState
+	prompt                    string
+	ctx                       context.Context
+	cancel                    context.CancelFunc
+	responseChan              chan string
+	exchangeCompletionChannel chan struct{}
+	exchangeEventChannel      chan exchangeEventType
 }
+
+type exchangeEventType string
+
+const (
+	exchangeEventStepCompleted     exchangeEventType = "step_completed"
+	exchangeEventExchangeCompleted exchangeEventType = "exchange_completed"
+)
 
 const (
 	chatInputMode chatMode = iota
@@ -143,21 +159,21 @@ type fileDisplayState struct {
 }
 
 type chatViewModel struct {
-	shared          *sharedState
-	history         []data.History
-	textarea        textarea.Model
-	viewport        viewport.Model
-	loading         bool
-	ready           bool
-	width           int
-	height          int
-	err             error
-	historyLoaded   bool
-	currentResponse string
-	currentPrompt   string
-	responseChan    chan string
-	doneChan        chan struct{}
-	mode            chatMode
+	shared                    *sharedState
+	history                   []data.History
+	textarea                  textarea.Model
+	viewport                  viewport.Model
+	loading                   bool
+	ready                     bool
+	width                     int
+	height                    int
+	err                       error
+	historyLoaded             bool
+	currentResponse           string
+	currentPrompt             string
+	responseChan              chan string
+	exchangeCompletionChannel chan struct{}
+	mode                      chatMode
 
 	// Model selection
 	availableModels  []string
@@ -208,11 +224,21 @@ type spinnerTickMsg struct{}
 type historyPersistedMsg int64
 
 type chatChunkMsg struct {
-	turnID       string
-	text         string
-	responseChan chan string
-	doneChan     chan struct{}
-	prompt       string
+	turnID                    string
+	text                      string
+	responseChan              chan string
+	exchangeCompletionChannel chan struct{}
+	exchangeEventChannel      chan exchangeEventType
+	prompt                    string
+}
+
+type chatExchangeEventMsg struct {
+	turnID                    string
+	eventType                 exchangeEventType
+	responseChan              chan string
+	exchangeCompletionChannel chan struct{}
+	exchangeEventChannel      chan exchangeEventType
+	prompt                    string
 }
 
 type chatCompleteMsg struct {
@@ -288,7 +314,7 @@ func newChatViewModel(shared *sharedState) *chatViewModel {
 	if openai_auth.HasCodexOAuthCredential() {
 		if preferredModel == "" {
 			for idx, model := range availableModels {
-				if model == "codex" {
+				if model == "gpt" {
 					selectedModelIdx = idx
 					break
 				}
@@ -423,25 +449,28 @@ func (m *chatViewModel) loadHistory() tea.Cmd {
 func (m *chatViewModel) sendMessage(prompt string) tea.Cmd {
 	return func() tea.Msg {
 		responseChan := make(chan string, 100)
-		doneChan := make(chan struct{})
+		exchangeCompletionChannel := make(chan struct{})
+		exchangeEventChannel := make(chan exchangeEventType, 8)
 		ctx, cancel := context.WithCancel(context.Background())
 		turnID := m.nextTurnID(turnTypeUser)
 		m.registerTurn(&chatTurn{
-			id:           turnID,
-			turnType:     turnTypeUser,
-			state:        turnStateActive,
-			prompt:       prompt,
-			ctx:          ctx,
-			cancel:       cancel,
-			responseChan: responseChan,
-			doneChan:     doneChan,
+			id:                        turnID,
+			turnType:                  turnTypeUser,
+			state:                     turnStateActive,
+			prompt:                    prompt,
+			ctx:                       ctx,
+			cancel:                    cancel,
+			responseChan:              responseChan,
+			exchangeCompletionChannel: exchangeCompletionChannel,
+			exchangeEventChannel:      exchangeEventChannel,
 		})
 
 		handler := &tuiResponseHandler{
-			responseChan: responseChan,
-			doneChan:     doneChan,
-			fullResponse: "",
-			Repository:   m.shared.config.Repository,
+			responseChan:              responseChan,
+			exchangeCompletionChannel: exchangeCompletionChannel,
+			exchangeEventChannel:      exchangeEventChannel,
+			fullResponse:              "",
+			Repository:                m.shared.config.Repository,
 		}
 
 		modelName := m.availableModels[m.selectedModelIdx]
@@ -501,12 +530,12 @@ func (m *chatViewModel) sendMessage(prompt string) tea.Cmd {
 			)
 		}()
 
-		waitCmd := waitForChatActivity(turnID, responseChan, doneChan, prompt)
+		waitCmd := waitForChatActivity(turnID, responseChan, exchangeCompletionChannel, exchangeEventChannel, prompt)
 		return waitCmd()
 	}
 }
 
-func waitForChatActivity(turnID string, responseChan chan string, doneChan chan struct{},
+func waitForChatActivity(turnID string, responseChan chan string, exchangeCompletionChannel chan struct{}, exchangeEventChannel chan exchangeEventType,
 	prompt string) tea.Cmd {
 
 	logger.Debug.Println("waitForChatActivity started")
@@ -519,14 +548,24 @@ func waitForChatActivity(turnID string, responseChan chan string, doneChan chan 
 				return chatCompleteMsg{turnID: turnID, prompt: prompt}
 			}
 			return chatChunkMsg{
-				turnID:       turnID,
-				text:         text,
-				responseChan: responseChan,
-				doneChan:     doneChan,
-				prompt:       prompt,
+				turnID:                    turnID,
+				text:                      text,
+				responseChan:              responseChan,
+				exchangeCompletionChannel: exchangeCompletionChannel,
+				exchangeEventChannel:      exchangeEventChannel,
+				prompt:                    prompt,
 			}
-		case <-doneChan:
-			logger.Debug.Printf("doneChan from waitForChatActivity")
+		case eventType := <-exchangeEventChannel:
+			return chatExchangeEventMsg{
+				turnID:                    turnID,
+				eventType:                 eventType,
+				responseChan:              responseChan,
+				exchangeCompletionChannel: exchangeCompletionChannel,
+				exchangeEventChannel:      exchangeEventChannel,
+				prompt:                    prompt,
+			}
+		case <-exchangeCompletionChannel:
+			logger.Debug.Printf("exchangeCompletionChannel from waitForChatActivity")
 			return chatCompleteMsg{turnID: turnID, prompt: prompt}
 		}
 	}
@@ -656,7 +695,20 @@ func (m *chatViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.currentResponse += msg.text
 		m.updateViewportContent()
-		return m, waitForChatActivity(msg.turnID, msg.responseChan, msg.doneChan, msg.prompt)
+		return m, waitForChatActivity(msg.turnID, msg.responseChan, msg.exchangeCompletionChannel, msg.exchangeEventChannel, msg.prompt)
+
+	case chatExchangeEventMsg:
+		if _, ok := m.getTurn(msg.turnID); !ok {
+			return m, nil
+		}
+		if msg.eventType == exchangeEventExchangeCompleted {
+			m.completeTurn(msg.turnID, turnStateCompleted)
+			logger.Debug.Println("got exchange completed event")
+			m.loading = false
+			m.statusMessage = ""
+			return m, m.loadHistory()
+		}
+		return m, waitForChatActivity(msg.turnID, msg.responseChan, msg.exchangeCompletionChannel, msg.exchangeEventChannel, msg.prompt)
 
 	case chatCompleteMsg:
 		if _, ok := m.getTurn(msg.turnID); !ok {
@@ -1618,7 +1670,7 @@ func (m *chatViewModel) updateViewportContent() {
 		return
 	}
 
-	assistantBg := termenv.RGBColor("#202020")
+	assistantBg := assistantResponseBackgroundColor
 	bubbleWidth := m.viewport.Width - 2
 	if bubbleWidth < 24 {
 		bubbleWidth = 24
@@ -2059,38 +2111,46 @@ func renderMarkdown(content string, width int) string {
 }
 
 type tuiResponseHandler struct {
-	responseChan chan string
-	doneChan     chan struct{}
-	fullResponse string
-	Repository   data.HistoryRepository
-	doneOnce     sync.Once
+	responseChan              chan string
+	exchangeCompletionChannel chan struct{}
+	exchangeEventChannel      chan exchangeEventType
+	fullResponse              string
+	Repository                data.HistoryRepository
+	exchangeCompletionOnce    sync.Once
 }
 
 func (h *tuiResponseHandler) RecievedText(text string, color *string) {
 	h.fullResponse += text
 	select {
-	case <-h.doneChan:
+	case <-h.exchangeCompletionChannel:
 		return
 	default:
 	}
 
 	select {
 	case h.responseChan <- text:
-	case <-h.doneChan:
+	case <-h.exchangeCompletionChannel:
+	default:
+		// Drop UI chunk if the queue is full to avoid blocking the stream goroutine.
+		// fullResponse still keeps the complete text for persistence.
 	}
 }
 
 func (h *tuiResponseHandler) FinalText(contextId int64, prompt string, response string, toolUse []data.ToolUse, modelName string, usage *commontypes.TokenUsage) {
-	h.fullResponse = response
+	persistedResponse := response
+	if strings.TrimSpace(persistedResponse) == "" && strings.TrimSpace(h.fullResponse) != "" {
+		persistedResponse = h.fullResponse
+	}
 
 	history := data.History{
-		ContextId:    contextId,
-		Prompt:       prompt,
-		Response:     response,
-		Abbreviation: "",
-		TokenCount:   0,
-		Model:        modelName,
-		ToolUse:      toolUse,
+		ContextId:       contextId,
+		Prompt:          prompt,
+		Response:        persistedResponse,
+		ResponseContent: h.fullResponse,
+		Abbreviation:    "",
+		TokenCount:      0,
+		Model:           modelName,
+		ToolUse:         toolUse,
 	}
 
 	if usage != nil {
@@ -2107,7 +2167,7 @@ func (h *tuiResponseHandler) FinalText(contextId int64, prompt string, response 
 		logger.HistoryPersisted(contextId)
 	}
 
-	code := services.ExtractCodeBlocks(response)
+	code := services.ExtractCodeBlocks(persistedResponse)
 	allCode := strings.Join(code, "\n\n")
 
 	err = clipboard.WriteAll(allCode)
@@ -2116,12 +2176,17 @@ func (h *tuiResponseHandler) FinalText(contextId int64, prompt string, response 
 	}
 
 	logger.Debug.Println("Final text in tui response channel")
+	select {
+	case h.exchangeEventChannel <- exchangeEventStepCompleted:
+	default:
+	}
 	if len(toolUse) == 0 {
-		logger.Debug.Println("closing doneChan")
-		h.doneOnce.Do(func() {
-			close(h.doneChan)
+		logger.Debug.Println("exchange completed (no tools); signaling via completion channel")
+		logger.Debug.Println("closing exchangeCompletionChannel")
+		h.exchangeCompletionOnce.Do(func() {
+			close(h.exchangeCompletionChannel)
 		})
 	} else {
-		logger.Debug.Println("not closing doneChan and responseChan because of expected response to tool call answers.")
+		logger.Debug.Println("keeping exchangeCompletionChannel open for tool-call continuation")
 	}
 }

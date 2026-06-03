@@ -1,6 +1,9 @@
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
+)
 
 var (
 	primaryColor   = lipgloss.Color("63")
@@ -47,8 +50,12 @@ var (
 
 	aiResponseStyle = lipgloss.NewStyle().
 			Padding(1, 2).
-			Margin(0, 0, 1, 0).
-			Foreground(lipgloss.Color("252"))
+			Margin(0, 0, 1, 0)
+		//.
+		//Foreground(lipgloss.Color("252"))
+
+	// Set to nil to disable the assistant response background.
+	assistantResponseBackgroundColor termenv.Color = termenv.RGBColor("#202020")
 
 	sendingStyle = lipgloss.NewStyle().
 			Foreground(primaryColor).
@@ -70,3 +77,8 @@ var (
 	usageMetricValueStyle = lipgloss.NewStyle().
 				Bold(true)
 )
+
+// SetAssistantResponseBackgroundColor changes the background used behind live assistant responses.
+func SetAssistantResponseBackgroundColor(bg termenv.Color) {
+	assistantResponseBackgroundColor = bg
+}
