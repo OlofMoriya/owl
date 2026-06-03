@@ -186,9 +186,9 @@ func resolveResponsesEndpoint(auth openai_auth.ResolvedAuth) (string, string) {
 func createResponsePayload(context *data.Context, prompt string, streaming bool, history []data.History, modifiers *commontypes.PayloadModifiers, requestedModel string) RequestPayload {
 	modelVersion := "gpt-5.3-chat-latest"
 	if requestedModel == "codex" {
-		modelVersion = "gpt-5.3-codex"
+		modelVersion = "gpt-5.4-codex"
 	} else if requestedModel == "gpt" {
-		modelVersion = "gpt-5.3-chat-latest"
+		modelVersion = "gpt-5.4"
 	} else if requestedModel == "gpt-5.5" {
 		modelVersion = "gpt-5.5"
 	} else if requestedModel == "gpt-5.4" {
@@ -466,7 +466,9 @@ func convertProperty(prop tools.Property) map[string]interface{} {
 func (model *OpenAiResponseModel) HandleStreamedLine(line []byte) {
 	responseLine := string(line)
 
-	logger.Debug.Printf("streamed raw line: %s", strings.TrimSpace(responseLine))
+	if responseLine != ""{
+		logger.Debug.Printf("streamed raw line: %s", strings.TrimSpace(responseLine))
+	}
 
 	if strings.HasPrefix(responseLine, "data: ") {
 		responseData, _ := strings.CutPrefix(responseLine, "data: ")
