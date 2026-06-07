@@ -1,6 +1,6 @@
 # Owl
 
-Owl is a Go-based AI assistant with three interfaces:
+Owl is a Go-based AI harness with three interfaces:
 
 - CLI mode for direct prompts
 - TUI mode for interactive terminal conversations
