@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -20,17 +21,20 @@ const (
 
 // DiffViewerModel is the bubbletea model for viewing and approving diffs
 type DiffViewerModel struct {
-	viewport     viewport.Model
-	diff         string
-	fileName     string
-	ready        bool
-	result       DiffApprovalResult
-	approved     bool
-	quit         bool
-	width        int
-	height       int
-	headerHeight int
-	footerHeight int
+	viewport         viewport.Model
+	diff             string
+	fileName         string
+	ready            bool
+	decision         ApprovalDecision
+	approved         bool
+	quit             bool
+	width            int
+	height           int
+	headerHeight     int
+	footerHeight     int
+	capturingReason  bool
+	reasonInput      textarea.Model
+	reasonPromptRows int
 }
 
 // Styles for the diff viewer
@@ -76,11 +80,20 @@ var (
 )
 
 func NewDiffViewerModel(fileName, diff string) DiffViewerModel {
+	reasonInput := textarea.New()
+	reasonInput.Placeholder = "Enter denial reason..."
+	reasonInput.Focus()
+	reasonInput.SetHeight(4)
+	reasonInput.ShowLineNumbers = false
+	reasonInput.Prompt = "> "
+
 	return DiffViewerModel{
-		diff:         diff,
-		fileName:     fileName,
-		headerHeight: 3,
-		footerHeight: 3,
+		diff:             diff,
+		fileName:         fileName,
+		headerHeight:     3,
+		footerHeight:     3,
+		reasonInput:      reasonInput,
+		reasonPromptRows: 7,
 	}
 }
 
@@ -96,36 +109,60 @@ func (m DiffViewerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.capturingReason {
+			switch msg.String() {
+			case "esc":
+				m.capturingReason = false
+				m.reasonInput.Blur()
+				return m, nil
+			case "ctrl+s":
+				m.decision = ApprovalDecision{Result: Rejected, Reason: strings.TrimSpace(m.reasonInput.Value())}
+				m.quit = true
+				return m, tea.Quit
+			}
+			m.reasonInput, cmd = m.reasonInput.Update(msg)
+			return m, cmd
+		}
+
 		switch msg.String() {
 		case "q", "esc":
-			m.result = Cancelled
+			m.decision = ApprovalDecision{Result: Cancelled}
 			m.quit = true
 			return m, tea.Quit
 		case "y", "Y":
-			m.result = Approved
+			m.decision = ApprovalDecision{Result: Approved}
 			m.approved = true
 			m.quit = true
 			return m, tea.Quit
 		case "n", "N":
-			m.result = Rejected
-			m.quit = true
-			return m, tea.Quit
+			m.capturingReason = true
+			m.reasonInput.Focus()
+			return m, textarea.Blink
 		}
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 
+		viewportHeight := msg.Height - m.headerHeight - m.footerHeight
+		if m.capturingReason {
+			viewportHeight -= m.reasonPromptRows
+			if viewportHeight < 3 {
+				viewportHeight = 3
+			}
+		}
+
 		if !m.ready {
-			// Initialize viewport with styled diff
-			m.viewport = viewport.New(msg.Width, msg.Height-m.headerHeight-m.footerHeight)
+			m.viewport = viewport.New(msg.Width, viewportHeight)
 			m.viewport.YPosition = m.headerHeight
 			m.viewport.SetContent(m.styleDiff())
 			m.ready = true
 		} else {
 			m.viewport.Width = msg.Width
-			m.viewport.Height = msg.Height - m.headerHeight - m.footerHeight
+			m.viewport.Height = viewportHeight
 		}
+
+		m.reasonInput.SetWidth(max(20, msg.Width-4))
 	}
 
 	// Update viewport
@@ -146,8 +183,13 @@ func (m DiffViewerModel) View() string {
 	// Footer
 	footer := m.footerView()
 
+	reasonSection := ""
+	if m.capturingReason {
+		reasonSection = "\n" + m.reasonView()
+	}
+
 	// Combine
-	return fmt.Sprintf("%s\n%s\n%s", header, m.viewport.View(), footer)
+	return fmt.Sprintf("%s\n%s%s\n%s", header, m.viewport.View(), reasonSection, footer)
 }
 
 func (m DiffViewerModel) headerView() string {
@@ -164,13 +206,27 @@ func (m DiffViewerModel) footerView() string {
 
 	// Help text
 	help := helpStyle.Render(" ↑/↓: scroll • ")
-	help += approveStyle.Render("y: approve")
-	help += helpStyle.Render(" • ")
-	help += rejectStyle.Render("n: reject")
-	help += helpStyle.Render(" • ")
-	help += cancelStyle.Render("q: cancel")
+	if m.capturingReason {
+		help += rejectStyle.Render("ctrl+s: save denial")
+		help += helpStyle.Render(" • ")
+		help += cancelStyle.Render("esc: back")
+	} else {
+		help += approveStyle.Render("y: approve")
+		help += helpStyle.Render(" • ")
+		help += rejectStyle.Render("n: reject")
+		help += helpStyle.Render(" • ")
+		help += cancelStyle.Render("q: cancel")
+	}
 
 	return fmt.Sprintf("%s\n%s", scrollInfo, help)
+}
+
+func (m DiffViewerModel) reasonView() string {
+	var b strings.Builder
+	b.WriteString(rejectStyle.Render("Denial reason required (optional but recommended):"))
+	b.WriteString("\n")
+	b.WriteString(m.reasonInput.View())
+	return b.String()
 }
 
 // styleDiff applies syntax highlighting to the diff
@@ -203,18 +259,18 @@ func (m DiffViewerModel) styleDiff() string {
 }
 
 // ShowDiffForApproval displays the diff and waits for user approval
-func ShowDiffForApproval(fileName, diff string) (DiffApprovalResult, error) {
+func ShowDiffForApproval(fileName, diff string) (ApprovalDecision, error) {
 	m := NewDiffViewerModel(fileName, diff)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 
 	finalModel, err := p.Run()
 	if err != nil {
-		return Cancelled, err
+		return ApprovalDecision{Result: Cancelled}, err
 	}
 
 	if m, ok := finalModel.(DiffViewerModel); ok {
-		return m.result, nil
+		return m.decision, nil
 	}
 
-	return Cancelled, fmt.Errorf("unexpected model type")
+	return ApprovalDecision{Result: Cancelled}, fmt.Errorf("unexpected model type")
 }

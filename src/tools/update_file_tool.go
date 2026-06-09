@@ -70,15 +70,18 @@ func (tool *FileUpdateTool) Run(i map[string]string) (string, error) {
 
 	// Show diff for approval if required
 	if requireApproval {
-		result, err := tool.requestApproval(fileName, diff)
+		decision, err := tool.requestApproval(fileName, diff)
 		if err != nil {
 			return "", fmt.Errorf("Failed to show approval dialog: %s", err)
 		}
 
-		switch result {
+		switch decision.Result {
 		case Approved:
 			logger.Screen("✓ User approved changes", color.RGB(0, 255, 0))
 		case Rejected:
+			if strings.TrimSpace(decision.Reason) != "" {
+				return fmt.Sprintf("Changes rejected by user. Reason: %s", decision.Reason), nil
+			}
 			return "Changes rejected by user", nil
 		case Cancelled:
 			return "Operation cancelled by user", nil
@@ -94,11 +97,11 @@ func (tool *FileUpdateTool) Run(i map[string]string) (string, error) {
 }
 
 // requestApproval shows the diff to the user and asks for approval
-func (tool *FileUpdateTool) requestApproval(fileName, diff string) (DiffApprovalResult, error) {
+func (tool *FileUpdateTool) requestApproval(fileName, diff string) (ApprovalDecision, error) {
 	// Check if we're in a TTY (interactive terminal)
 	if !isTerminal() {
 		logger.Screen("⚠ Not in interactive terminal, auto-approving", color.RGB(255, 255, 0))
-		return Approved, nil
+		return ApprovalDecision{Result: Approved}, nil
 	}
 
 	logger.Screen("\n"+lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFF00")).Render("⚡ Review required - launching diff viewer..."), color.RGB(255, 255, 0))

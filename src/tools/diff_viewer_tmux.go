@@ -12,10 +12,10 @@ import (
 type TmuxDiffViewer struct{}
 
 // ShowDiffInTmux displays the diff in a tmux popup and returns user's decision
-func ShowDiffInTmux(fileName, diff string) (DiffApprovalResult, error) {
+func ShowDiffInTmux(fileName, diff string) (ApprovalDecision, error) {
 	// Check if we're in a tmux session
 	if os.Getenv("TMUX") == "" {
-		return Cancelled, fmt.Errorf("not in a tmux session")
+		return ApprovalDecision{Result: Cancelled}, fmt.Errorf("not in a tmux session")
 	}
 
 	// Create temporary files for the diff and the response
@@ -29,7 +29,7 @@ func ShowDiffInTmux(fileName, diff string) (DiffApprovalResult, error) {
 
 	// Write the diff to a file
 	if err := os.WriteFile(diffFile, []byte(diff), 0644); err != nil {
-		return Cancelled, fmt.Errorf("failed to write diff file: %s", err)
+		return ApprovalDecision{Result: Cancelled}, fmt.Errorf("failed to write diff file: %s", err)
 	}
 	defer os.Remove(diffFile)
 
@@ -56,20 +56,14 @@ WIDTH=$(tput cols 2>/dev/null || echo "120")
 
 # Show the diff with colors using delta, bat, or fallback
 if command -v delta &> /dev/null; then
-    # Delta works best with stdin, pipe the diff to it
-    # Let delta auto-detect width, or use tput cols if available
     if [ "$WIDTH" -gt 160 ]; then
-        # Wide terminal: use side-by-side
         cat "%s" | delta --line-numbers --side-by-side
     else
-        # Narrow terminal: regular view
         cat "%s" | delta --line-numbers
     fi
 elif command -v bat &> /dev/null; then
-    # Bat can handle diff files directly
     bat --style=grid --color=always --language=diff "%s"
 else
-    # Fallback to manual coloring with sed and less
     cat "%s" | sed \
         -e 's/^+++.*/\x1b[1;36m&\x1b[0m/' \
         -e 's/^---.*/\x1b[1;36m&\x1b[0m/' \
@@ -82,7 +76,7 @@ echo ""
 echo -e "${BLUE}────────────────────────────────────────────────────────────${NC}"
 echo ""
 echo -e "  ${GREEN}[y]${NC} Approve and apply changes"
-echo -e "  ${RED}[n]${NC} Reject changes"
+echo -e "  ${RED}[n]${NC} Reject changes (with reason)"
 echo -e "  ${YELLOW}[q]${NC} Cancel operation"
 
 while true; do
@@ -94,17 +88,22 @@ echo ""
 
 	case "$REPLY" in
 		y|Y)
-			echo "approved" > "%s"
+			printf 'approved\n' > "%s"
 			echo -e "\n${GREEN}✓ Changes approved!${NC}"
 			break
 			;;
 		n|N)
-			echo "rejected" > "%s"
+			echo -n "Reason for denial: "
+			IFS= read -r DENIAL_REASON
+			{
+				printf 'rejected\n'
+				printf '%%s\n' "$DENIAL_REASON"
+			} > "%s"
 			echo -e "\n${RED}✗ Changes rejected!${NC}"
             break
 			;;
-		c|C)
-			echo "cancelled" > "%s"
+		c|C|q|Q)
+			printf 'cancelled\n' > "%s"
 			echo -e "\n${YELLOW}⚠ Operation cancelled!${NC}"
 			break
 			;;
@@ -118,12 +117,10 @@ sleep 1
 `, fileName, diffFile, diffFile, diffFile, diffFile, responseFile, responseFile, responseFile)
 
 	if err := os.WriteFile(scriptFile, []byte(script), 0755); err != nil {
-		return Cancelled, fmt.Errorf("failed to write script file: %s", err)
+		return ApprovalDecision{Result: Cancelled}, fmt.Errorf("failed to write script file: %s", err)
 	}
 	defer os.Remove(scriptFile)
 
-	// Launch tmux popup with the script
-	// Use 90% width and height for the popup
 	cmd := exec.Command("tmux", "display-popup",
 		"-E",
 		"-w", "90%",
@@ -132,34 +129,24 @@ sleep 1
 		scriptFile)
 
 	if err := cmd.Run(); err != nil {
-		return Cancelled, fmt.Errorf("failed to run tmux popup: %s", err)
+		return ApprovalDecision{Result: Cancelled}, fmt.Errorf("failed to run tmux popup: %s", err)
 	}
 
-	// Read the response
 	responseBytes, err := os.ReadFile(responseFile)
 	if err != nil {
-		// No response file means cancelled or error
-		return Cancelled, nil
+		return ApprovalDecision{Result: Cancelled}, nil
 	}
 	defer os.Remove(responseFile)
 
-	response := strings.TrimSpace(string(responseBytes))
-	switch response {
-	case "approved":
-		return Approved, nil
-	case "rejected":
-		return Rejected, nil
-	default:
-		return Cancelled, nil
-	}
+	return parseApprovalDecision(string(responseBytes)), nil
 }
 
 // ShowDiffInTerminal shows diff using less or bat in the current terminal
-func ShowDiffInTerminal(fileName, diff string) (DiffApprovalResult, error) {
+func ShowDiffInTerminal(fileName, diff string) (ApprovalDecision, error) {
 	// Create temporary file for the diff
 	tmpFile, err := os.CreateTemp("", "owl-diff-*.diff")
 	if err != nil {
-		return Cancelled, fmt.Errorf("failed to create temp file: %s", err)
+		return ApprovalDecision{Result: Cancelled}, fmt.Errorf("failed to create temp file: %s", err)
 	}
 	defer os.Remove(tmpFile.Name())
 
@@ -175,7 +162,6 @@ func ShowDiffInTerminal(fileName, diff string) (DiffApprovalResult, error) {
 	tmpFile.WriteString(diff)
 	tmpFile.Close()
 
-	// Try delta first (pipe content to it)
 	if _, err := exec.LookPath("delta"); err == nil {
 		cmd := exec.Command("sh", "-c", fmt.Sprintf("cat '%s' | delta --paging=always", tmpFile.Name()))
 		cmd.Stdout = os.Stdout
@@ -183,14 +169,12 @@ func ShowDiffInTerminal(fileName, diff string) (DiffApprovalResult, error) {
 		cmd.Stdin = os.Stdin
 		cmd.Run()
 	} else if _, err := exec.LookPath("bat"); err == nil {
-		// Try bat
 		cmd := exec.Command("bat", "--style=grid", "--color=always", "--language=diff", tmpFile.Name())
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		cmd.Stdin = os.Stdin
 		cmd.Run()
 	} else {
-		// Fallback to less with colored output
 		cmd := exec.Command("sh", "-c", fmt.Sprintf("cat '%s' | sed -e 's/^+++.*/\\x1b[1;36m&\\x1b[0m/' -e 's/^---.*/\\x1b[1;36m&\\x1b[0m/' -e 's/^+.*/\\x1b[32m&\\x1b[0m/' -e 's/^-.*/\\x1b[31m&\\x1b[0m/' -e 's/^@@.*/\\x1b[36m&\\x1b[0m/' | less -R", tmpFile.Name()))
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -198,10 +182,9 @@ func ShowDiffInTerminal(fileName, diff string) (DiffApprovalResult, error) {
 		cmd.Run()
 	}
 
-	// Ask for approval
 	fmt.Println("\n────────────────────────────────────────────────────────────")
 	fmt.Println("\n  \033[32m[y]\033[0m Approve and apply changes")
-	fmt.Println("  \033[31m[n]\033[0m Reject changes")
+	fmt.Println("  \033[31m[n]\033[0m Reject changes (with reason)")
 	fmt.Println("  \033[33m[q]\033[0m Cancel operation")
 	fmt.Print("\nYour choice: ")
 
@@ -211,11 +194,14 @@ func ShowDiffInTerminal(fileName, diff string) (DiffApprovalResult, error) {
 	response = strings.ToLower(strings.TrimSpace(response))
 	switch response {
 	case "y", "yes":
-		return Approved, nil
+		return ApprovalDecision{Result: Approved}, nil
 	case "n", "no":
-		return Rejected, nil
+		fmt.Print("Reason for denial: ")
+		var reason string
+		fmt.Scanln(&reason)
+		return ApprovalDecision{Result: Rejected, Reason: strings.TrimSpace(reason)}, nil
 	default:
-		return Cancelled, nil
+		return ApprovalDecision{Result: Cancelled}, nil
 	}
 }
 
@@ -225,7 +211,6 @@ func DetectBestViewer() string {
 		return "tmux"
 	}
 
-	// Check if we have bubbletea-compatible terminal
 	if isTerminal() {
 		return "bubbletea"
 	}
@@ -234,7 +219,7 @@ func DetectBestViewer() string {
 }
 
 // ShowDiffWithBestViewer automatically selects the best viewer
-func ShowDiffWithBestViewer(fileName, diff string) (DiffApprovalResult, error) {
+func ShowDiffWithBestViewer(fileName, diff string) (ApprovalDecision, error) {
 	viewer := os.Getenv("OWL_DIFF_VIEWER")
 	if viewer == "" {
 		viewer = DetectBestViewer()
@@ -246,14 +231,12 @@ func ShowDiffWithBestViewer(fileName, diff string) (DiffApprovalResult, error) {
 		if err == nil {
 			return result, nil
 		}
-		// Fall back to bubbletea if tmux fails
 		fallthrough
 	case "bubbletea":
 		return ShowDiffForApproval(fileName, diff)
 	case "terminal":
 		return ShowDiffInTerminal(fileName, diff)
 	default:
-		// Default to bubbletea
 		return ShowDiffForApproval(fileName, diff)
 	}
 }

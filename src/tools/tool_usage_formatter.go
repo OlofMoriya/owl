@@ -13,19 +13,27 @@ type ToolUsageFormatter interface {
 }
 
 func FormatToolUseForDisplay(toolUse data.ToolUse) []string {
+	return sanitizeDisplayLines(FormatToolUseForDisplayRaw(toolUse))
+}
+
+func FormatToolUseForDisplayRaw(toolUse data.ToolUse) []string {
 	if tool, err := GetTool(toolUse.Name); err == nil {
 		if formatter, ok := tool.(ToolUsageFormatter); ok {
-			lines := sanitizeDisplayLines(formatter.FormatToolUse(toolUse))
+			lines := formatter.FormatToolUse(toolUse)
 			if len(lines) > 0 {
 				return lines
 			}
 		}
 	}
 
-	return defaultToolUseDisplayLines(toolUse)
+	return defaultToolUseDisplayLinesRaw(toolUse)
 }
 
 func defaultToolUseDisplayLines(toolUse data.ToolUse) []string {
+	return sanitizeDisplayLines(defaultToolUseDisplayLinesRaw(toolUse))
+}
+
+func defaultToolUseDisplayLinesRaw(toolUse data.ToolUse) []string {
 	status := "✓"
 	if !toolUse.Result.Success {
 		status = "✗"
@@ -52,8 +60,7 @@ func defaultToolUseDisplayLines(toolUse data.ToolUse) []string {
 	if resultPreview != "" {
 		lines = append(lines, fmt.Sprintf("result: %s", resultPreview))
 	}
-
-	return sanitizeDisplayLines(lines)
+	return lines
 }
 
 func ParseToolUseInput(toolUse data.ToolUse) map[string]string {

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"encoding/json"
 	"fmt"
 	"owl/data"
 	"owl/services"
@@ -148,8 +149,7 @@ func (m *chatHistoryViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "y":
 				// Copy code to clipboard
 				if m.expandedIdx >= 0 && m.expandedIdx < len(visibleHistory) {
-					code := services.ExtractCodeBlocks(visibleHistory[m.expandedIdx].Response)
-					allCode := strings.Join(code, "\n\n")
+					allCode := strings.Join(collectHistoryCodeBlocks(visibleHistory[m.expandedIdx]), "\n\n")
 					clipboard.WriteAll(allCode)
 				}
 				return m, nil
@@ -249,13 +249,10 @@ func (m *chatHistoryViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "c":
 			// View code for selected message
-			if m.cursor < len(visibleHistory) {
-				code := services.ExtractCodeBlocks(visibleHistory[m.cursor].Response)
-				if len(code) > 0 {
-					m.expandedIdx = m.cursor
-					m.mode = historyCodeViewMode
-					m.updateContent()
-				}
+			if m.cursor < len(visibleHistory) && len(collectHistoryCodeBlocks(visibleHistory[m.cursor])) > 0 {
+				m.expandedIdx = m.cursor
+				m.mode = historyCodeViewMode
+				m.updateContent()
 			}
 
 		case "y":
@@ -355,8 +352,7 @@ func (m *chatHistoryViewModel) renderCompactMode(visible []data.History) string 
 
 		// Check if message contains code
 		codeIndicator := ""
-		code := services.ExtractCodeBlocks(h.Response)
-		if len(code) > 0 {
+		if len(collectHistoryCodeBlocks(h)) > 0 {
 			codeIndicator = dimStyle.Render(" 💻")
 		}
 
@@ -458,11 +454,14 @@ func (m *chatHistoryViewModel) renderExpandedMode(visible []data.History) string
 	b.WriteString(headerStyle.Render(fmt.Sprintf("Message %d of %d%s", m.expandedIdx+1, len(visible), archivedStatus)))
 	b.WriteString("\n\n")
 
-	// Check if has code
-	code := services.ExtractCodeBlocks(h.Response)
-	if len(code) > 0 {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("💻 Contains %d code block(s) - press 'c' to view", len(code))))
+	codeBlocks := collectHistoryCodeBlocks(h)
+	if len(codeBlocks) > 0 {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("💻 Contains %d code block(s) - press 'c' to view", len(codeBlocks))))
 		b.WriteString("\n\n")
+	}
+
+	if len(h.ToolUse) > 0 {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("🔧 Tool calls: %d\n\n", len(h.ToolUse))))
 	}
 
 	// Prompt
@@ -489,7 +488,7 @@ func (m *chatHistoryViewModel) renderCodeViewMode(visible []data.History) string
 	}
 
 	h := visible[m.expandedIdx]
-	code := services.ExtractCodeBlocks(h.Response)
+	codeBlocks := collectHistoryCodeBlocks(h)
 
 	var b strings.Builder
 
@@ -497,11 +496,11 @@ func (m *chatHistoryViewModel) renderCodeViewMode(visible []data.History) string
 	b.WriteString(headerStyle.Render(fmt.Sprintf("Code Blocks - Message %d", m.expandedIdx+1)))
 	b.WriteString("\n\n")
 
-	if len(code) == 0 {
+	if len(codeBlocks) == 0 {
 		b.WriteString(dimStyle.Render("No code blocks found"))
 	} else {
-		for i, block := range code {
-			b.WriteString(dimStyle.Render(fmt.Sprintf("─── Block %d of %d ───", i+1, len(code))))
+		for i, block := range codeBlocks {
+			b.WriteString(dimStyle.Render(fmt.Sprintf("─── Block %d of %d ───", i+1, len(codeBlocks))))
 			b.WriteString("\n")
 			b.WriteString(block)
 			b.WriteString("\n\n")
@@ -509,6 +508,35 @@ func (m *chatHistoryViewModel) renderCodeViewMode(visible []data.History) string
 	}
 
 	return b.String()
+}
+
+func collectHistoryCodeBlocks(h data.History) []string {
+	blocks := services.ExtractCodeBlocks(h.Response)
+	for _, tu := range h.ToolUse {
+		if tu.Name != "run_go_snippet_reviewed" {
+			continue
+		}
+		code := extractReviewedGoSnippetCode(tu.Input)
+		if strings.TrimSpace(code) != "" {
+			blocks = append(blocks, code)
+		}
+	}
+	return blocks
+}
+
+func extractReviewedGoSnippetCode(rawInput string) string {
+	if strings.TrimSpace(rawInput) == "" {
+		return ""
+	}
+
+	var input struct {
+		Code string `json:"Code"`
+	}
+	if err := json.Unmarshal([]byte(rawInput), &input); err != nil {
+		return ""
+	}
+
+	return input.Code
 }
 
 func (m *chatHistoryViewModel) View() string {
