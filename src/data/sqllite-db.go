@@ -296,7 +296,7 @@ func (user User) GetHistoryByContextId(contextId int64, maxCount int) ([]History
 	db := user.getUserDb()
 	defer db.Close()
 
-	logger.Debug.Printf("Fetching history for contextId: %v, maxCount: %v", contextId, maxCount)
+	//logger.Debug.Printf("Fetching history for contextId: %v, maxCount: %v", contextId, maxCount)
 	selectQuery := "SELECT id, context_id, prompt, response, response_content, abreviation, token_count, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, created, tool_results, COALESCE(model, 'sonnet'), archived FROM history WHERE context_id = ? ORDER BY ID DESC LIMIT ?"
 	rows, err := db.Query(selectQuery, contextId, maxCount)
 	if err != nil {

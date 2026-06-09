@@ -153,10 +153,10 @@ func Logout() error {
 }
 
 func Resolve() (ResolvedAuth, error) {
-	debugln("openai auth resolve: start")
+	logger.Debug.Println("openai auth resolve: start")
 	oauth, path, err := loadOAuthFile()
 	if err == nil {
-		debugf(
+		logger.Debug.Printf(
 			"openai auth resolve: loaded oauth file path=%s type=%s has_access=%t has_refresh=%t expires_at_ms=%d account_id_present=%t",
 			path,
 			oauth.Type,
@@ -165,11 +165,11 @@ func Resolve() (ResolvedAuth, error) {
 			oauth.expiresAt(),
 			oauth.resolvedAccountID() != "",
 		)
-		debugf("openai auth resolve: token fingerprint=%s", tokenFingerprint(oauth.AccessToken))
+		logger.Debug.Println("openai auth resolve: token fingerprint=%s", tokenFingerprint(oauth.AccessToken))
 		now := time.Now().UnixMilli()
 		expiresAt := oauth.expiresAt()
 		refreshNeeded := oauth.RefreshToken != "" && oauth.AccessToken != "" && now+openAIOAuthEarlySkew >= expiresAt
-		debugf(
+		logger.Debug.Printf(
 			"openai auth resolve: refresh decision now_ms=%d expires_at_ms=%d skew_ms=%d refresh_needed=%t",
 			now,
 			expiresAt,
@@ -179,14 +179,14 @@ func Resolve() (ResolvedAuth, error) {
 		if refreshNeeded {
 			oldFingerprint := tokenFingerprint(oauth.AccessToken)
 			oldExpiresAt := oauth.expiresAt()
-			debugf("openai auth resolve: refreshing token path=%s", path)
+			logger.Debug.Printf("openai auth resolve: refreshing token path=%s", path)
 			refreshed, refreshErr := refreshToken(oauth.RefreshToken)
 			if refreshErr != nil {
-				debugf("openai auth resolve: refresh failed path=%s err=%v", path, refreshErr)
+				logger.Debug.Printf("openai auth resolve: refresh failed path=%s err=%v", path, refreshErr)
 				return ResolvedAuth{}, fmt.Errorf("openai oauth refresh failed: %w", refreshErr)
 			}
 			oauth.updateFromRefresh(refreshed)
-			debugf(
+			logger.Debug.Printf(
 				"openai auth resolve: refresh success token_changed=%t expires_at_old=%d expires_at_new=%d new_fingerprint=%s",
 				oldFingerprint != tokenFingerprint(oauth.AccessToken),
 				oldExpiresAt,
@@ -194,15 +194,15 @@ func Resolve() (ResolvedAuth, error) {
 				tokenFingerprint(oauth.AccessToken),
 			)
 			if writeErr := writeOAuthFile(path, oauth); writeErr != nil {
-				debugf("openai auth resolve: persisted refresh failed path=%s err=%v", path, writeErr)
+				logger.Debug.Printf("openai auth resolve: persisted refresh failed path=%s err=%v", path, writeErr)
 				return ResolvedAuth{}, fmt.Errorf("openai oauth persist failed: %w", writeErr)
 			}
-			debugf("openai auth resolve: persisted refreshed token path=%s", path)
+			logger.Debug.Printf("openai auth resolve: persisted refreshed token path=%s", path)
 		}
 
 		if oauth.AccessToken != "" {
 			accountID := oauth.resolvedAccountID()
-			debugf(
+			logger.Debug.Printf(
 				"openai auth resolve: selected_source=oauth source_path=%s selection_reason=oauth_file_present account_id_present=%t token_fingerprint=%s",
 				path,
 				strings.TrimSpace(accountID) != "",
@@ -211,18 +211,18 @@ func Resolve() (ResolvedAuth, error) {
 			return ResolvedAuth{Token: oauth.AccessToken, AccountID: accountID, IsCodex: true}, nil
 		}
 
-		debugf("openai auth resolve: oauth file path=%s had empty access token fallback_trigger=empty_access_token", path)
+		logger.Debug.Printf("openai auth resolve: oauth file path=%s had empty access token fallback_trigger=empty_access_token", path)
 	} else {
-		debugf("openai auth resolve: oauth file load failed err=%v fallback_trigger=oauth_file_unavailable", err)
+		logger.Debug.Printf("openai auth resolve: oauth file load failed err=%v fallback_trigger=oauth_file_unavailable", err)
 	}
 
 	apiKey, ok := os.LookupEnv("OPENAI_API_KEY")
 	if !ok || apiKey == "" {
-		debugln("openai auth resolve: no oauth and OPENAI_API_KEY missing")
+		logger.Debug.Println("openai auth resolve: no oauth and OPENAI_API_KEY missing")
 		return ResolvedAuth{}, fmt.Errorf("could not fetch OPENAI_API_KEY and no codex oauth token found")
 	}
 
-	debugf(
+	logger.Debug.Printf(
 		"openai auth resolve: selected_source=api_key selection_reason=oauth_unavailable_or_invalid token_fingerprint=%s",
 		tokenFingerprint(apiKey),
 	)
@@ -255,16 +255,16 @@ func loadOAuthFile() (oauthFile, string, error) {
 	}
 
 	openCodePath := filepath.Join(home, openCodeAuthFilePath)
-	debugf("openai auth resolve: checking opencode auth path=%s", openCodePath)
+	logger.Debug.Printf("openai auth resolve: checking opencode auth path=%s", openCodePath)
 	if auth, err := loadOpenCodeOAuthFile(openCodePath); err == nil {
-		debugf("openai auth resolve: using opencode auth file path=%s", openCodePath)
+		logger.Debug.Printf("openai auth resolve: using opencode auth file path=%s", openCodePath)
 		return auth, openCodePath, nil
 	} else {
-		debugf("openai auth resolve: opencode auth file unavailable path=%s err=%v", openCodePath, err)
+		logger.Debug.Printf("openai auth resolve: opencode auth file unavailable path=%s err=%v", openCodePath, err)
 	}
 
 	path := filepath.Join(home, openAIOAuthFilePath)
-	debugf("openai auth resolve: checking owl auth path=%s", path)
+	logger.Debug.Printf("openai auth resolve: checking owl auth path=%s", path)
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return oauthFile{}, path, err
@@ -507,18 +507,6 @@ func tokenFingerprint(token string) string {
 	}
 	hash := sha256.Sum256([]byte(trimmed))
 	return hex.EncodeToString(hash[:6])
-}
-
-func debugln(msg string) {
-	if logger.Debug != nil {
-		logger.Debug.Println(msg)
-	}
-}
-
-func debugf(format string, args ...interface{}) {
-	if logger.Debug != nil {
-		logger.Debug.Printf(format, args...)
-	}
 }
 
 func (a *oauthFile) updateFromRefresh(refresh refreshResponse) {
