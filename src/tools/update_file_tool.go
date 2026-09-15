@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"owl/data"
+	"owl/interaction"
 	"owl/logger"
 	"path/filepath"
 	"regexp"
@@ -70,7 +71,7 @@ func (tool *FileUpdateTool) Run(i map[string]string) (string, error) {
 
 	// Show diff for approval if required
 	if requireApproval {
-		decision, err := tool.requestApproval(fileName, diff)
+		decision, err := tool.requestApproval(fileName, diff, strings.TrimSpace(i["Summary"]))
 		if err != nil {
 			return "", fmt.Errorf("Failed to show approval dialog: %s", err)
 		}
@@ -96,9 +97,13 @@ func (tool *FileUpdateTool) Run(i map[string]string) (string, error) {
 	return result, nil
 }
 
-// requestApproval shows the diff to the user and asks for approval
-func (tool *FileUpdateTool) requestApproval(fileName, diff string) (ApprovalDecision, error) {
-	// Check if we're in a TTY (interactive terminal)
+// requestApproval shows the diff to the user and asks for approval.
+func (tool *FileUpdateTool) requestApproval(fileName, diff, summary string) (ApprovalDecision, error) {
+	if interaction.DiffApprovalPromptChan != nil {
+		return requestIntegratedDiffApproval(fileName, diff, summary)
+	}
+
+	// Check if we're in a TTY (interactive terminal).
 	if !isTerminal() {
 		logger.Screen("⚠ Not in interactive terminal, auto-approving", color.RGB(255, 255, 0))
 		return ApprovalDecision{Result: Approved}, nil
@@ -106,8 +111,32 @@ func (tool *FileUpdateTool) requestApproval(fileName, diff string) (ApprovalDeci
 
 	logger.Screen("\n"+lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFF00")).Render("⚡ Review required - launching diff viewer..."), color.RGB(255, 255, 0))
 
-	// Use the best available viewer
+	// Use the best available standalone viewer.
 	return ShowDiffWithBestViewer(fileName, diff)
+}
+
+func requestIntegratedDiffApproval(fileName, diff, summary string) (ApprovalDecision, error) {
+	responseChan := make(chan interaction.DiffApprovalResult, 1)
+	interaction.DiffApprovalPromptChan <- interaction.DiffApprovalPrompt{
+		FileName:     fileName,
+		Diff:         diff,
+		Summary:      summary,
+		ResponseChan: responseChan,
+	}
+
+	result, ok := <-responseChan
+	if !ok {
+		return ApprovalDecision{Result: Cancelled}, fmt.Errorf("diff approval closed without a decision")
+	}
+
+	switch result.Decision {
+	case interaction.DiffApprovalApproved:
+		return ApprovalDecision{Result: Approved}, nil
+	case interaction.DiffApprovalRejected:
+		return ApprovalDecision{Result: Rejected, Reason: result.Reason}, nil
+	default:
+		return ApprovalDecision{Result: Cancelled}, nil
+	}
 }
 
 // applyDiff applies a unified diff patch to the file
@@ -130,40 +159,50 @@ func (tool *FileUpdateTool) applyDiff(fileName, diff string) (string, error) {
 	}
 	tmpFile.Close()
 
-	// Try to apply the patch using git apply
-	cmd := exec.Command("git", "apply", "--unidiff-zero", tmpFile.Name())
+	// Models frequently get unified-diff hunk counts wrong even when the hunk
+	// body is valid. Let git derive the counts from the body instead of rejecting
+	// an otherwise applicable patch as corrupt.
+	cmd := exec.Command("git", "apply", "--unidiff-zero", "--recount", tmpFile.Name())
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
 		logger.Screen("\nfailed to apply with git apply, testing patch fallback", color.RGB(150, 150, 150))
 		gitApplyOutput := string(output)
 
-		// If git apply fails, try with patch command and common strip levels.
+		// If git apply fails, try patch with common strip levels. Always dry-run
+		// first: patch can otherwise apply early hunks before a later hunk fails,
+		// leaving the file partially modified even though this tool returns an error.
 		stripLevels := []string{"1", "0"}
 		var lastErr error
 		var lastOutput []byte
 		for _, stripLevel := range stripLevels {
-			cmd = exec.Command("patch", "-p"+stripLevel, "-i", tmpFile.Name())
-			output, err = cmd.CombinedOutput()
-			if err == nil {
-				lastErr = nil
-				lastOutput = output
-				break
+			dryRun := exec.Command("patch", "--batch", "--dry-run", "-p"+stripLevel, "-i", tmpFile.Name())
+			dryRunOutput, dryRunErr := dryRun.CombinedOutput()
+			if dryRunErr != nil {
+				lastErr = dryRunErr
+				lastOutput = dryRunOutput
+				continue
 			}
+
+			cmd = exec.Command("patch", "--batch", "-p"+stripLevel, "-i", tmpFile.Name())
+			output, err = cmd.CombinedOutput()
 			lastErr = err
 			lastOutput = output
+			break
 		}
 
 		if lastErr != nil {
 			logger.Screen("\nfailed to apply patch, testing content-based fallback", color.RGB(150, 150, 150))
 
-			if contentFallbackErr := applyDiffByContent(fileName, diff); contentFallbackErr == nil {
+			contentFallbackErr := applyDiffByContent(fileName, diff)
+			if contentFallbackErr == nil {
 				result := fmt.Sprintf("Successfully applied diff to '%s' using content-based fallback", fileName)
 				logger.Screen(result, color.RGB(150, 150, 150))
 				return result, nil
 			}
 
-			logger.Screen("\ncontent-based fallback failed", color.RGB(150, 150, 150))
+			logger.Screen(fmt.Sprintf("\ncontent-based fallback failed: %v", contentFallbackErr), color.RGB(150, 150, 150))
+			lastOutput = append(lastOutput, []byte("\ncontent-based fallback: "+contentFallbackErr.Error())...)
 			artifactPath, writeErr := persistFailedDiffArtifact(fileName, diff, "apply", gitApplyOutput, string(lastOutput), lastErr)
 			if writeErr != nil {
 				return "", fmt.Errorf(
@@ -313,7 +352,8 @@ func (tool *FileUpdateTool) GetDefinition() (Tool, string) {
 		Dependencies: []ToolDependency{ToolDependencyLocalExec},
 
 		InputSchema: InputSchema{
-			Type: "object",
+			Type:     "object",
+			Required: []string{"FileName", "Diff", "Summary"},
 			Properties: map[string]Property{
 				"FileName": {
 					Type:        "string",
@@ -322,6 +362,10 @@ func (tool *FileUpdateTool) GetDefinition() (Tool, string) {
 				"Diff": {
 					Type:        "string",
 					Description: "A unified diff format patch to apply. THE FORMAT NEEDS TO ALWAYS END WITH A NEW LINE! Example format:\n--- a/file.txt\n+++ b/file.txt\n@@ -1,3 +1,3 @@\n line1\n-old line\n+new line\n line3\n",
+				},
+				"Summary": {
+					Type:        "string",
+					Description: "A concise user-facing explanation of why this change is needed and what it does. This is shown beside the diff during approval.",
 				},
 			},
 		},
