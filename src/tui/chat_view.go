@@ -135,6 +135,7 @@ const (
 	chatModelSelectMode
 	chatQuestionMode
 	chatFileDisplayMode
+	chatDiffApprovalMode
 )
 
 type questionAnswerState struct {
@@ -191,6 +192,7 @@ type chatViewModel struct {
 	lastUsage        *commontypes.TokenUsage
 	questionPrompt   *questionPromptState
 	fileDisplay      *fileDisplayState
+	diffApproval     *diffApprovalState
 	selectedPDF      string
 	selectedSkills   []string
 	activeTurns      map[string]*chatTurn
@@ -258,6 +260,10 @@ type questionPromptMsg struct {
 
 type fileDisplayPromptMsg struct {
 	prompt interaction.FileDisplayPrompt
+}
+
+type diffApprovalPromptMsg struct {
+	prompt interaction.DiffApprovalPrompt
 }
 
 type authCommandResultMsg struct {
@@ -358,6 +364,7 @@ func (m *chatViewModel) Init() tea.Cmd {
 		m.listenForHistoryPersisted(),
 		m.listenForQuestionPrompts(),
 		m.listenForFileDisplayPrompts(),
+		m.listenForDiffApprovalPrompts(),
 	)
 }
 
@@ -428,6 +435,21 @@ func (m *chatViewModel) listenForFileDisplayPrompts() tea.Cmd {
 		}
 
 		return fileDisplayPromptMsg{prompt: prompt}
+	}
+}
+
+func (m *chatViewModel) listenForDiffApprovalPrompts() tea.Cmd {
+	return func() tea.Msg {
+		if interaction.DiffApprovalPromptChan == nil {
+			return nil
+		}
+
+		prompt, ok := <-interaction.DiffApprovalPromptChan
+		if !ok {
+			return nil
+		}
+
+		return diffApprovalPromptMsg{prompt: prompt}
 	}
 }
 
@@ -695,6 +717,7 @@ func (m *chatViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.currentResponse += msg.text
 		m.updateViewportContent()
+		m.refreshDiffApprovalConversation()
 		return m, waitForChatActivity(msg.turnID, msg.responseChan, msg.exchangeCompletionChannel, msg.exchangeEventChannel, msg.prompt)
 
 	case chatExchangeEventMsg:
@@ -750,7 +773,14 @@ func (m *chatViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mode = chatFileDisplayMode
 		return m, m.listenForFileDisplayPrompts()
 
+	case diffApprovalPromptMsg:
+		m.beginDiffApproval(msg.prompt)
+		return m, m.listenForDiffApprovalPrompts()
+
 	case tea.KeyMsg:
+		if m.mode == chatDiffApprovalMode {
+			return m, m.handleDiffApprovalKey(msg)
+		}
 		if m.mode == chatQuestionMode {
 			return m, m.handleQuestionModeKey(msg)
 		}
@@ -1038,6 +1068,9 @@ func (m *chatViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.fileDisplay != nil {
 			m.fileDisplay.viewport.Width = m.contentWidth()
 			m.fileDisplay.viewport.Height = max(5, m.height-8)
+		}
+		if m.diffApproval != nil {
+			m.resizeDiffApproval()
 		}
 	}
 
@@ -1449,6 +1482,10 @@ func (m *chatViewModel) View() string {
 		return m.renderFileDisplayPrompt()
 	}
 
+	if m.mode == chatDiffApprovalMode {
+		return m.renderDiffApprovalWorkspace()
+	}
+
 	spinnerStatus := ""
 	if m.hasActiveUserTurn() && len(m.spinnerFrames) > 0 {
 		spinnerStatus = sendingStyle.Render(m.spinnerFrames[m.spinnerFrame] + " ")
@@ -1670,8 +1707,15 @@ func (m *chatViewModel) updateViewportContent() {
 		return
 	}
 
+	m.viewport.SetContent(m.renderConversationContent(m.viewport.Width))
+	if m.viewport.Height > 0 && m.viewport.Width > 0 {
+		m.viewport.GotoBottom()
+	}
+}
+
+func (m *chatViewModel) renderConversationContent(viewportWidth int) string {
 	assistantBg := assistantResponseBackgroundColor
-	bubbleWidth := m.viewport.Width - 2
+	bubbleWidth := viewportWidth - 2
 	if bubbleWidth < 24 {
 		bubbleWidth = 24
 	}
@@ -1733,10 +1777,7 @@ func (m *chatViewModel) updateViewportContent() {
 		b.WriteString("\n")
 	}
 
-	m.viewport.SetContent(b.String())
-	if m.viewport.Height > 0 && m.viewport.Width > 0 {
-		m.viewport.GotoBottom()
-	}
+	return b.String()
 }
 
 func renderToolUseSummary(toolUses []data.ToolUse) string {
