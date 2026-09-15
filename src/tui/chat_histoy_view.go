@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"owl/data"
 	"owl/services"
+	"owl/tools"
 	"strings"
 
 	"github.com/atotto/clipboard"
@@ -461,7 +462,10 @@ func (m *chatHistoryViewModel) renderExpandedMode(visible []data.History) string
 	}
 
 	if len(h.ToolUse) > 0 {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("🔧 Tool calls: %d\n\n", len(h.ToolUse))))
+		b.WriteString(dimStyle.Render(fmt.Sprintf("🔧 Tool calls: %d", len(h.ToolUse))))
+		b.WriteString("\n")
+		b.WriteString(renderToolUseHistory(h.ToolUse))
+		b.WriteString("\n")
 	}
 
 	// Prompt
@@ -508,6 +512,54 @@ func (m *chatHistoryViewModel) renderCodeViewMode(visible []data.History) string
 	}
 
 	return b.String()
+}
+
+func renderToolUseHistory(toolUses []data.ToolUse) string {
+	var b strings.Builder
+	for idx, tu := range toolUses {
+		if idx > 0 {
+			b.WriteString("\n")
+		}
+
+		lines := tools.FormatToolUseForDisplayRaw(tu)
+		for _, line := range lines {
+			b.WriteString(styleToolHistoryLine(line))
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+func styleToolHistoryLine(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(line, "    ") {
+		return toolValueStyle.Render(line)
+	}
+
+	if strings.Contains(trimmed, " ✗") {
+		return toolFailureStyle.Render(trimmed)
+	}
+	if strings.Contains(trimmed, " ✓") {
+		return toolSuccessStyle.Render(trimmed)
+	}
+
+	if strings.HasPrefix(trimmed, "warning:") || strings.HasPrefix(trimmed, "warnings:") || strings.HasPrefix(trimmed, "output: withheld") {
+		return toolWarningStyle.Render(trimmed)
+	}
+
+	if strings.HasPrefix(trimmed, "result:") || strings.HasPrefix(trimmed, "files:") || strings.HasPrefix(trimmed, "failed:") || strings.HasPrefix(trimmed, "output:") {
+		return toolResultStyle.Render(trimmed)
+	}
+
+	if strings.HasPrefix(trimmed, "code:") {
+		return toolResultStyle.Render(trimmed)
+	}
+
+	return toolLineStyle.Render(trimmed)
 }
 
 func collectHistoryCodeBlocks(h data.History) []string {

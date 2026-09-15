@@ -76,6 +76,27 @@ var (
 
 	usageMetricValueStyle = lipgloss.NewStyle().
 				Bold(true)
+
+	toolLineStyle = lipgloss.NewStyle().
+			Foreground(secondaryColor)
+
+	toolResultStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("252"))
+
+	toolWarningStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("214")).
+			Bold(true)
+
+	toolFailureStyle = lipgloss.NewStyle().
+			Foreground(errorColor).
+			Bold(true)
+
+	toolSuccessStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("42")).
+			Bold(true)
+
+	toolValueStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("250"))
 )
 
 // SetAssistantResponseBackgroundColor changes the background used behind live assistant responses.

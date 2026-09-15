@@ -181,16 +181,30 @@ func (tool *RunGoSnippetReviewedTool) FormatToolUse(toolUse data.ToolUse) []stri
 	lines = append(lines,
 		fmt.Sprintf("sha256: %s", hex.EncodeToString(hash[:])),
 		fmt.Sprintf("code_lines: %d", len(codeLines)),
-		"code:",
 	)
+
+	if strings.Contains(toolUse.Result.Content, "withheld by user") {
+		lines = append(lines, "output: withheld by user")
+	}
+
+	outputSummary := summarizeSnippetResult(toolUse.Result.Content)
+	if outputSummary != "" {
+		lines = append(lines, outputSummary)
+	}
+
+	warnings := detectSensitiveOutput(toolUse.Result.Content)
+	if len(warnings) > 0 {
+		warningLabels := make([]string, 0, len(warnings))
+		for _, warning := range warnings {
+			warningLabels = append(warningLabels, warning.Label)
+		}
+		lines = append(lines, fmt.Sprintf("warnings: %s", strings.Join(warningLabels, ", ")))
+	}
+
+	lines = append(lines, "code:")
 
 	for _, line := range codeLines {
 		lines = append(lines, "    "+line)
-	}
-
-	resultPreview := strings.TrimSpace(toolUse.Result.Content)
-	if resultPreview != "" {
-		lines = append(lines, fmt.Sprintf("result: %s", singleLine(resultPreview, 120)))
 	}
 
 	return lines
@@ -207,6 +221,31 @@ func validateGoSnippetReviewedInput(code string) error {
 		return fmt.Errorf("imports of os/exec are blocked")
 	}
 	return nil
+}
+
+func summarizeSnippetResult(result string) string {
+	text := strings.TrimSpace(result)
+	if text == "" {
+		return ""
+	}
+
+	if strings.Contains(text, "withheld by user") {
+		return ""
+	}
+
+	hasStdout := strings.Contains(text, "stdout:\n") && !strings.Contains(text, "stdout:\n<empty>")
+	hasStderr := strings.Contains(text, "stderr:\n")
+
+	switch {
+	case hasStdout && hasStderr:
+		return "result: stdout + stderr"
+	case hasStdout:
+		return "result: stdout"
+	case hasStderr:
+		return "result: stderr"
+	default:
+		return fmt.Sprintf("result: %s", singleLine(text, 120))
+	}
 }
 
 func parseRunGoSnippetTimeout(raw string) (int, error) {

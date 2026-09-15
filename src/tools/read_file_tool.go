@@ -199,8 +199,20 @@ func (tool *ReadFileTool) FormatToolUse(toolUse data.ToolUse) []string {
 	}
 
 	lines := []string{fmt.Sprintf("read_file %s", status)}
+	requestedFiles := 0
 	if fileNames := strings.TrimSpace(input["FileNames"]); fileNames != "" {
-		lines = append(lines, fmt.Sprintf("files: %s", singleLine(fileNames, 100)))
+		parts := strings.Split(fileNames, ";")
+		for _, part := range parts {
+			if strings.TrimSpace(part) != "" {
+				requestedFiles++
+			}
+		}
+
+		if requestedFiles <= 2 {
+			lines = append(lines, fmt.Sprintf("files: %s", singleLine(strings.ReplaceAll(fileNames, ";", ", "), 100)))
+		} else {
+			lines = append(lines, fmt.Sprintf("files: %d requested", requestedFiles))
+		}
 	}
 
 	start := strings.TrimSpace(input["StartLine"])
@@ -215,7 +227,60 @@ func (tool *ReadFileTool) FormatToolUse(toolUse data.ToolUse) []string {
 		lines = append(lines, fmt.Sprintf("lines: %s-%s", start, end))
 	}
 
+	result := toolUse.Result.Content
+	returnedFiles := strings.Count(result, "=== ")
+	if returnedFiles > 0 {
+		if requestedFiles > 0 && returnedFiles < requestedFiles {
+			lines = append(lines, fmt.Sprintf("result: %d/%d files read", returnedFiles, requestedFiles))
+		} else {
+			lines = append(lines, fmt.Sprintf("result: %d file%s read", returnedFiles, pluralSuffix(returnedFiles)))
+		}
+	}
+
+	if strings.Contains(result, "Failed files:") {
+		failedCount := countFailedReadFiles(result)
+		if failedCount > 0 {
+			lines = append(lines, fmt.Sprintf("warning: %d failed", failedCount))
+		} else {
+			lines = append(lines, "warning: file read failures")
+		}
+	}
+
+	if strings.Contains(result, "[truncated") {
+		lines = append(lines, "result: truncated")
+	}
+
 	return lines
+}
+
+func countFailedReadFiles(result string) int {
+	lines := strings.Split(strings.ReplaceAll(result, "\r\n", "\n"), "\n")
+	count := 0
+	inFailedSection := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "Failed files:" {
+			inFailedSection = true
+			continue
+		}
+		if !inFailedSection {
+			continue
+		}
+		if trimmed == "" {
+			break
+		}
+		if strings.HasPrefix(trimmed, "-") || strings.HasPrefix(trimmed, "•") {
+			count++
+		}
+	}
+	return count
+}
+
+func pluralSuffix(count int) string {
+	if count == 1 {
+		return ""
+	}
+	return "s"
 }
 
 func isForbiddenEnvFile(path string) bool {
