@@ -1,13 +1,21 @@
 package models
 
 import (
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"owl/logger"
 	open_ai_gpt_model "owl/models/open-ai-gpt"
 	open_ai_responses "owl/models/open-ai-responses"
 )
+
+func TestMain(m *testing.M) {
+	logger.Debug = log.New(io.Discard, "", 0)
+	os.Exit(m.Run())
+}
 
 func TestGetModelForQuery_DefaultsToClaudeWithoutCodexAuth(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -40,9 +48,16 @@ func TestGetModelForQuery_DefaultsToCodexWithCodexAuth(t *testing.T) {
 		t.Fatalf("write failed: %v", err)
 	}
 
-	_, modelName := GetModelForQuery("", nil, nil, nil, false, false, false, false)
+	model, modelName := GetModelForQuery("", nil, nil, nil, false, false, false, false)
 	if modelName != "codex" {
 		t.Fatalf("expected default model codex, got %q", modelName)
+	}
+	responsesModel, ok := model.(*open_ai_responses.OpenAiResponseModel)
+	if !ok {
+		t.Fatalf("expected OpenAI Responses model with OAuth, got %T", model)
+	}
+	if responsesModel.ModelVersion != codexOAuthModelVersion {
+		t.Fatalf("expected authenticated Codex model %q, got %q", codexOAuthModelVersion, responsesModel.ModelVersion)
 	}
 }
 
@@ -60,7 +75,11 @@ func TestGetModelForQuery_GptUsesResponsesWithCodexAuth(t *testing.T) {
 	}
 
 	model, _ := GetModelForQuery("gpt", nil, nil, nil, false, false, false, false)
-	if _, ok := model.(*open_ai_responses.OpenAiResponseModel); !ok {
+	responsesModel, ok := model.(*open_ai_responses.OpenAiResponseModel)
+	if !ok {
 		t.Fatalf("expected responses model with oauth")
+	}
+	if responsesModel.ModelVersion != codexOAuthModelVersion {
+		t.Fatalf("expected authenticated GPT model %q, got %q", codexOAuthModelVersion, responsesModel.ModelVersion)
 	}
 }

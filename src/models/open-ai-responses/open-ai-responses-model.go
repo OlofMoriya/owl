@@ -183,17 +183,23 @@ func resolveResponsesEndpoint(auth openai_auth.ResolvedAuth) (string, string) {
 	return "https://api.openai.com/v1/responses", "api_key_or_non_codex"
 }
 
-func createResponsePayload(context *data.Context, prompt string, streaming bool, history []data.History, modifiers *commontypes.PayloadModifiers, requestedModel string) RequestPayload {
-	modelVersion := "gpt-5.3-chat-latest"
-	if requestedModel == "codex" {
-		modelVersion = "gpt-5.4-codex"
-	} else if requestedModel == "gpt" {
-		modelVersion = "gpt-5.4"
-	} else if requestedModel == "gpt-5.5" {
-		modelVersion = "gpt-5.5"
-	} else if requestedModel == "gpt-5.4" {
-		modelVersion = "gpt-5.4"
+func responseModelVersion(requestedModel string) string {
+	switch requestedModel {
+	case "codex", "gpt-5.6-sol":
+		return "gpt-5.6-sol"
+	case "gpt":
+		return "gpt-5.4"
+	case "gpt-5.5":
+		return "gpt-5.5"
+	case "gpt-5.4":
+		return "gpt-5.4"
+	default:
+		return "gpt-5.3-chat-latest"
 	}
+}
+
+func createResponsePayload(context *data.Context, prompt string, streaming bool, history []data.History, modifiers *commontypes.PayloadModifiers, requestedModel string) RequestPayload {
+	modelVersion := responseModelVersion(requestedModel)
 
 	if modifiers == nil {
 		modifiers = &commontypes.PayloadModifiers{}
@@ -466,7 +472,7 @@ func convertProperty(prop tools.Property) map[string]interface{} {
 func (model *OpenAiResponseModel) HandleStreamedLine(line []byte) {
 	responseLine := string(line)
 
-	if responseLine != ""{
+	if responseLine != "" {
 		logger.Debug.Printf("streamed raw line: %s", strings.TrimSpace(responseLine))
 	}
 

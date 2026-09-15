@@ -14,6 +14,8 @@ import (
 	"owl/openai_auth"
 )
 
+const codexOAuthModelVersion = "gpt-5.6-sol"
+
 func GetModelForQuery(
 	requestedModel string,
 	context *data.Context,
@@ -53,13 +55,13 @@ func GetModelForQuery(
 		model = &openai_4o_model.OpenAi4oModel{OpenAICompatibleModel: openai_base.OpenAICompatibleModel{ResponseHandler: responseHandler, HistoryRepository: historyRepository}, ModelVersion: "gpt-4o"}
 	case "gpt":
 		if openai_auth.HasCodexOAuthCredential() {
-			model = &open_ai_responses.OpenAiResponseModel{ResponseHandler: responseHandler, HistoryRepository: historyRepository, ModelVersion: modelToUse}
+			model = &open_ai_responses.OpenAiResponseModel{ResponseHandler: responseHandler, HistoryRepository: historyRepository, ModelVersion: codexOAuthModelVersion}
 		} else {
 			model = &open_ai_gpt_model.OpenAIGPTModel{OpenAICompatibleModel: openai_base.OpenAICompatibleModel{ResponseHandler: responseHandler, HistoryRepository: historyRepository}, ModelVersion: modelToUse}
 		}
 	case "codex":
 		if openai_auth.HasCodexOAuthCredential() {
-			model = &open_ai_responses.OpenAiResponseModel{ResponseHandler: responseHandler, HistoryRepository: historyRepository, ModelVersion: modelToUse}
+			model = &open_ai_responses.OpenAiResponseModel{ResponseHandler: responseHandler, HistoryRepository: historyRepository, ModelVersion: codexOAuthModelVersion}
 		} else {
 			model = &open_ai_gpt_model.OpenAIGPTModel{OpenAICompatibleModel: openai_base.OpenAICompatibleModel{ResponseHandler: responseHandler, HistoryRepository: historyRepository}, ModelVersion: modelToUse}
 		}
