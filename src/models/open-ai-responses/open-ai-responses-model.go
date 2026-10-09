@@ -185,7 +185,9 @@ func resolveResponsesEndpoint(auth openai_auth.ResolvedAuth) (string, string) {
 
 func responseModelVersion(requestedModel string) string {
 	switch requestedModel {
-	case "codex", "gpt-5.6-sol":
+	case "codex", "gpt-6.1-sol":
+		return "gpt-6.1-sol"
+	case "gpt-5.6-sol":
 		return "gpt-5.6-sol"
 	case "gpt":
 		return "gpt-5.4"

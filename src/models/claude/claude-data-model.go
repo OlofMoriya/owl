@@ -3,14 +3,15 @@ package claude_model
 import "encoding/json"
 
 type MessageBody struct {
-	Model     string          `json:"model"`
-	Messages  Message         `json:"messages"`
-	MaxTokens int             `json:"max_tokens"`
-	System    []SystemContent `json:"system,omitempty"`
-	Stream    bool            `json:"stream"`
-	Thinking  *ThinkingBlock  `json:"thinking,omitempty"`
-	Temp      float32         `json:"temperature"`
-	Tools     []ToolModel     `json:"tools"`
+	Model        string          `json:"model"`
+	Messages     Message         `json:"messages"`
+	MaxTokens    int             `json:"max_tokens"`
+	System       []SystemContent `json:"system,omitempty"`
+	Stream       bool            `json:"stream"`
+	Thinking     *ThinkingBlock  `json:"thinking,omitempty"`
+	Temp         *float32        `json:"temperature,omitempty"`
+	OutputConfig *OutputConfig   `json:"output_config,omitempty"`
+	Tools        []ToolModel     `json:"tools"`
 }
 
 // CacheControl enables prompt caching for content blocks
@@ -57,7 +58,11 @@ type InputSchema struct {
 
 type ThinkingBlock struct {
 	Type         string `json:"type"`
-	BudgetTokens int    `json:"budget_tokens"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+}
+
+type OutputConfig struct {
+	Effort string `json:"effort"`
 }
 
 // SystemContent represents system prompt content with optional caching

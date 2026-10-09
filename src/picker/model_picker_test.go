@@ -56,8 +56,8 @@ func TestGetModelForQuery_DefaultsToCodexWithCodexAuth(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected OpenAI Responses model with OAuth, got %T", model)
 	}
-	if responsesModel.ModelVersion != codexOAuthModelVersion {
-		t.Fatalf("expected authenticated Codex model %q, got %q", codexOAuthModelVersion, responsesModel.ModelVersion)
+	if responsesModel.ModelVersion != "gpt-6.1-sol" {
+		t.Fatalf("expected authenticated Codex model gpt-6.1-sol, got %q", responsesModel.ModelVersion)
 	}
 }
 
@@ -79,7 +79,7 @@ func TestGetModelForQuery_GptUsesResponsesWithCodexAuth(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected responses model with oauth")
 	}
-	if responsesModel.ModelVersion != codexOAuthModelVersion {
-		t.Fatalf("expected authenticated GPT model %q, got %q", codexOAuthModelVersion, responsesModel.ModelVersion)
+	if responsesModel.ModelVersion != "gpt-6.1-sol" {
+		t.Fatalf("expected authenticated GPT model gpt-6.1-sol, got %q", responsesModel.ModelVersion)
 	}
 }

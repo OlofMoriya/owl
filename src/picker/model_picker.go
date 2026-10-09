@@ -14,7 +14,7 @@ import (
 	"owl/openai_auth"
 )
 
-const codexOAuthModelVersion = "gpt-5.6-sol"
+const codexOAuthModelVersion = "gpt-6.1-sol"
 
 func GetModelForQuery(
 	requestedModel string,

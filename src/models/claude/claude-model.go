@@ -58,13 +58,13 @@ func (model *ClaudeModel) CreateRequest(context *data.Context, prompt string, st
 	var model_version string
 	switch model.ModelVersion {
 	case "opus":
-		model_version = "claude-opus-4-6"
+		model_version = "claude-opus-5-5"
 	case "sonnet":
-		model_version = "claude-sonnet-4-5-20250929"
+		model_version = "claude-sonnet-5-5"
 	case "haiku":
 		model_version = "claude-haiku-4-5-20251001"
 	default:
-		model_version = "claude-sonnet-4-5-20250929"
+		model_version = "claude-sonnet-5-5"
 	}
 
 	payload := createClaudePayload(prompt, streaming, history, model_version, model.UseThinking, context, modifiers)
@@ -727,12 +727,25 @@ func createClaudePayload(prompt string, streamed bool, history []data.History, m
 		payload.System = []SystemContent{systemContent}
 	}
 
+	adaptiveThinking := strings.HasPrefix(model, "claude-sonnet-5-") ||
+		strings.HasPrefix(model, "claude-opus-5-") ||
+		model == "claude-sonnet-4-6" || model == "claude-opus-4-6"
+	if !adaptiveThinking {
+		temperature := float32(0)
+		payload.Temp = &temperature
+	}
 	if useThinking {
-		payload.Thinking = &ThinkingBlock{
-			Type:         "enabled",
-			BudgetTokens: 2000,
+		if adaptiveThinking {
+			payload.Thinking = &ThinkingBlock{Type: "adaptive"}
+			payload.OutputConfig = &OutputConfig{Effort: "medium"}
+		} else {
+			payload.Thinking = &ThinkingBlock{
+				Type:         "enabled",
+				BudgetTokens: 2000,
+			}
+			temperature := float32(1)
+			payload.Temp = &temperature
 		}
-		payload.Temp = 1
 	}
 
 	// logger.Debug.Println("FULL PAYLOAD:")
