@@ -325,19 +325,15 @@ Creates new files or overwrites existing files.
 Updates specific parts of existing files without replacing entire content.
 
 **Capabilities:**
-- Update using unified diff format (recommended)
-- Update by line number ranges
-- Update by text markers
-- Precise modification of file sections
+- Update an existing file using unified diff format
+- Show an integrated approval workspace in TUI mode without starting a nested terminal UI
+- Preserve the current conversation beside/above the proposed diff during review
+- Fall back to standalone Bubble Tea, tmux, or terminal approval outside the TUI
 
 **Parameters:**
 - `FileName` (string, required): Path of file to update
-- `Diff` (string): Unified diff format patch (recommended method)
-- `Content` (string): New content to insert/replace
-- `StartLine` (number): Line number to start update (1-indexed)
-- `EndLine` (number): Line number to end update (1-indexed, inclusive)
-- `StartText` (string): Text marker for where to start update
-- `EndText` (string): Text marker for where to end update
+- `Diff` (string, required): Unified diff format patch
+- `Summary` (string, required): Concise user-facing rationale shown during approval
 
 ---
 

@@ -186,19 +186,17 @@ Creates new files or overwrites existing ones with provided content. Includes se
 
 **Purpose**: Surgical file modification tool
 
-Advanced file updating with three methods:
-1. **Unified diff** (recommended) - Git-style patches
-2. **Line numbers** - Replace specific line ranges
-3. **Text markers** - Replace content between text strings
+Applies targeted changes to existing files using Git-style unified diffs.
 
-Includes an optional approval system with diff viewer integration. Can show changes in a TUI before applying them.
+Includes an optional approval system. When Owl's TUI is active, the tool sends a request through `interaction.DiffApprovalPromptChan`; the existing chat program renders the conversation and diff together and returns the decision without starting a nested Bubble Tea program. CLI runs retain standalone Bubble Tea, tmux, and terminal fallbacks.
 
 **Tool Name**: `update_file`
 
 **Key Features**:
-- Diff preview generation
-- User approval workflow
-- Multiple update strategies
+- Diff preview generation with a required user-facing change summary
+- Responsive side-by-side or stacked review workspace in chat
+- User approval workflow over request/response channels
+- Standalone viewer fallbacks outside the integrated TUI
 - Safety checks (same as write_file)
 
 ---
@@ -286,9 +284,9 @@ Fetches HTML pages over HTTP(S), extracts the main readable content, and returns
 
 ## Owl architecture - tools/diff_viewer.go
 
-**Purpose**: Interactive diff approval viewer
+**Purpose**: Standalone interactive diff approval viewer
 
-Bubbletea-based TUI for reviewing and approving file changes. Features:
+Bubbletea-based fallback for reviewing and approving file changes outside Owl's integrated chat TUI. Features:
 - Syntax-highlighted diff display
 - Scrollable viewport
 - Approve/Reject/Cancel options

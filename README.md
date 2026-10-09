@@ -200,7 +200,7 @@ User-selectable models wired through `picker.GetModelForQuery`:
 - `haiku`
 - `4o`
 - `gpt`
-- `codex`
+- `codex` (uses `gpt-6.1-sol` with OpenAI OAuth authentication)
 - `grok`
 - `gemeni`
 - `ollama`
