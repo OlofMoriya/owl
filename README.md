@@ -10,7 +10,16 @@ It supports context-aware chat history, model switching, streaming responses, to
 
 ## Quick Start
 
-### Build
+### Install with Homebrew (macOS)
+
+```bash
+brew install olofmoriya/tap/owl
+owl -help
+```
+
+Use `owl` instead of `./owl` in the examples below if you installed it with Homebrew.
+
+### Build from source
 
 ```bash
 cd src

@@ -3,6 +3,7 @@ package logger
 import (
 	"log"
 	"os"
+	"path/filepath"
 
 	"github.com/fatih/color"
 	"github.com/mitchellh/go-homedir"
@@ -20,6 +21,9 @@ func Init(filename string) error {
 		return err
 	}
 
+	if err := os.MkdirAll(filepath.Dir(expandedPath), 0700); err != nil {
+		return err
+	}
 	f, err := os.OpenFile(expandedPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
 		return err
